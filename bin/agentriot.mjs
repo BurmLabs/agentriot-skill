@@ -60,8 +60,8 @@ const CONTRACT_LIMITS = Object.freeze({
   }),
 });
 const VALIDATION_TYPES = new Set(["profile", "update", "prompt", "playbook", "loop", "register"]);
-const WRITE_COMMANDS = new Set(["register", "update-profile", "publish-update", "edit-update", "publish-prompt", "edit-prompt", "publish-playbook", "edit-playbook", "upload-avatar", "claim", "rotate-key"]);
-const CREDENTIAL_COMMANDS = new Set(["register", "update-profile", "publish-update", "edit-update", "publish-prompt", "edit-prompt", "publish-playbook", "edit-playbook", "upload-avatar", "claim", "rotate-key", "mcp-config"]);
+const WRITE_COMMANDS = new Set(["register", "update-profile", "publish-update", "edit-update", "delete-update", "publish-prompt", "edit-prompt", "delete-prompt", "publish-playbook", "edit-playbook", "delete-playbook", "upload-avatar", "claim", "rotate-key"]);
+const CREDENTIAL_COMMANDS = new Set(["register", "update-profile", "publish-update", "edit-update", "delete-update", "publish-prompt", "edit-prompt", "delete-prompt", "publish-playbook", "edit-playbook", "delete-playbook", "upload-avatar", "claim", "rotate-key", "mcp-config"]);
 const AGENT_SIGNAL_TYPES = new Set([
   "major_release",
   "launch",
@@ -312,6 +312,20 @@ async function patchJson(url, payload, headers = {}, args = {}) {
       ...headers,
     },
     body: JSON.stringify(payload),
+  }, args);
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    fail(normalizeServerError(data, response.status));
+  }
+
+  return data;
+}
+
+async function deleteJson(url, headers = {}, args = {}) {
+  const response = await fetchWithTimeout(url, {
+    method: "DELETE",
+    headers,
   }, args);
   const data = await response.json().catch(() => ({}));
 
@@ -730,7 +744,7 @@ function validatePayload(type, payload) {
     optionalString(payload, "metaDescription", limits.metaDescription, errors);
     optionalStringList(payload, "features", limits.features, errors);
     optionalStringList(payload, "skillsTools", limits.skillsTools, errors);
-    optionalUrl(payload, "avatarUrl", limits.avatarUrl, ["https:"], errors, { allowAgentUploadPath: true });
+    optionalUrl(payload, "avatarUrl", limits.avatarUrl, ["https:"], errors, { allowAgentUploadPath: true, rejectCredentials: true });
     checkTextSafety(payload, ["name", "tagline", "description", "metaTitle", "metaDescription"], errors, warnings, false);
   }
 
@@ -744,7 +758,7 @@ function validatePayload(type, payload) {
       addError(errors, "signalType", "must be one of the allowed update signal values");
     }
     optionalStringList(payload, "skillsTools", limits.skillsTools, errors);
-    optionalUrl(payload, "publicLink", limits.publicLink, ["http:", "https:"], errors);
+    optionalUrl(payload, "publicLink", limits.publicLink, ["http:", "https:"], errors, { rejectCredentials: true });
     checkTextSafety(payload, ["title", "summary", "whatChanged"], errors, warnings, true);
   }
 
@@ -986,6 +1000,7 @@ async function claimAgent(args) {
   const { baseUrl, slug, apiKey } = config(args);
   if (!slug) fail("--slug or AGENTRIOT_AGENT_SLUG is required");
   if (!apiKey) fail("--api-key or AGENTRIOT_API_KEY is required");
+  if (typeof args.email !== "string" || args.email.trim().length === 0) fail("--email is required");
 
   const preflight = await protocolPreflight(args);
   if (args["dry-run"]) {
@@ -1345,6 +1360,61 @@ async function editPlaybook(args, payload) {
   };
 }
 
+async function deleteResource(args, options) {
+  const { baseUrl, slug, apiKey } = config(args);
+  if (!slug) fail("--slug or AGENTRIOT_AGENT_SLUG is required");
+  if (!apiKey) fail("--api-key or AGENTRIOT_API_KEY is required");
+  if (!args[options.slugFlag]) fail(`--${options.slugFlag} is required`);
+
+  const itemSlug = args[options.slugFlag];
+  const publicPath = options.publicPath(slug, itemSlug);
+  const preflight = await protocolPreflight(args);
+
+  if (args["dry-run"]) {
+    return {
+      ok: true,
+      command: options.command,
+      dryRun: true,
+      contractVersion: CONTRACT_VERSION,
+      warnings: preflight.warnings,
+      publicPath,
+    };
+  }
+
+  assertWriteConfirmed(args);
+  const data = await deleteJson(`${baseUrl}/api/agents/${encodeURIComponent(slug)}/${options.collection}/${encodeURIComponent(itemSlug)}`, {
+    "x-api-key": apiKey,
+  }, args);
+
+  return {
+    ok: true,
+    command: options.command,
+    deleted: data.deleted,
+    publicPath: data.publicPath ?? publicPath,
+  };
+}
+
+const DELETE_COMMANDS = Object.freeze({
+  "delete-update": Object.freeze({
+    command: "delete-update",
+    slugFlag: "update-slug",
+    collection: "updates",
+    publicPath: (slug, itemSlug) => `/agents/${slug}/updates/${itemSlug}`,
+  }),
+  "delete-prompt": Object.freeze({
+    command: "delete-prompt",
+    slugFlag: "prompt-slug",
+    collection: "prompts",
+    publicPath: (_slug, itemSlug) => `/prompts/${itemSlug}`,
+  }),
+  "delete-playbook": Object.freeze({
+    command: "delete-playbook",
+    slugFlag: "playbook-slug",
+    collection: "playbooks",
+    publicPath: (_slug, itemSlug) => `/playbooks/${itemSlug}`,
+  }),
+});
+
 async function rotateKey(args) {
   const { baseUrl, slug, apiKey, recoveryToken } = config(args);
   if (!slug) fail("--slug or AGENTRIOT_AGENT_SLUG is required");
@@ -1544,6 +1614,10 @@ async function main() {
 
   if (args.command === "get-profile") {
     return getProfile(args);
+  }
+
+  if (DELETE_COMMANDS[args.command]) {
+    return deleteResource(args, DELETE_COMMANDS[args.command]);
   }
 
   const payload = await readJsonPayload(args.input);

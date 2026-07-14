@@ -243,6 +243,8 @@ test("dry-run rejects invalid boolean values before network access", async () =>
       "lifecycle-agent",
       "--api-key",
       "agrt_secret_key",
+      "--email",
+      "owner@example.com",
       "--base-url",
       baseUrl,
       "--dry-run",
@@ -355,6 +357,8 @@ test("live claim requires explicit write confirmation before mutation", async ()
       "lifecycle-agent",
       "--api-key",
       "agrt_secret_key",
+      "--email",
+      "owner@example.com",
       "--base-url",
       baseUrl,
     ]);
@@ -362,6 +366,32 @@ test("live claim requires explicit write confirmation before mutation", async ()
     assert.equal(result.code, 1);
     assert.match(result.stderr, /--confirm-write true is required for live writes/u);
     assert.equal(mutationRequests, 0);
+  });
+});
+
+test("claim email is required before protocol preflight", async () => {
+  let requests = 0;
+
+  await withServer((_request, response) => {
+    requests += 1;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify(protocolResponse()));
+  }, async (baseUrl) => {
+    const result = await runCliFailure([
+      "claim",
+      "--slug",
+      "lifecycle-agent",
+      "--api-key",
+      "agrt_secret_key",
+      "--base-url",
+      baseUrl,
+      "--dry-run",
+      "true",
+    ]);
+
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /--email is required/u);
+    assert.equal(requests, 0);
   });
 });
 
@@ -645,6 +675,40 @@ test("validate rejects blocked update links locally", async () => {
   const invalid = await runCliFailure(["validate", "--type", "update", "--input", invalidPath]);
   assert.equal(invalid.code, 1);
   assert.match(invalid.stderr, /publicLink must use http or https URL protocol/u);
+});
+
+test("validate rejects embedded credentials in avatarUrl", async () => {
+  const inputPath = await writePayload("profile.json", {
+    avatarUrl: "https://user:pass@example.com/avatar.png",
+  });
+
+  const invalid = await runCliFailure(["validate", "--type", "profile", "--input", inputPath]);
+  assert.equal(invalid.code, 1);
+  assert.match(invalid.stderr, /avatarUrl must not include embedded credentials/u);
+});
+
+test("validate rejects embedded credentials in publicLink", async () => {
+  const inputPath = await writePayload("update.json", {
+    title: "Launched pipeline",
+    summary: "New pipeline processes research notes.",
+    whatChanged: "Published a public update.",
+    signalType: "status",
+    publicLink: "https://user:pass@example.com/launch",
+  });
+
+  const invalid = await runCliFailure(["validate", "--type", "update", "--input", inputPath]);
+  assert.equal(invalid.code, 1);
+  assert.match(invalid.stderr, /publicLink must not include embedded credentials/u);
+});
+
+test("validate rejects embedded credentials in sourceUrl", async () => {
+  const inputPath = await writePayload("playbook.json", validPlaybookPayload({
+    sourceUrl: "https://user:pass@example.com/playbook",
+  }));
+
+  const invalid = await runCliFailure(["validate", "--type", "playbook", "--input", inputPath]);
+  assert.equal(invalid.code, 1);
+  assert.match(invalid.stderr, /sourceUrl must not include embedded credentials/u);
 });
 
 test("validate accepts safe prompt code fences with literal script tags", async () => {
@@ -1455,6 +1519,111 @@ test("edit-playbook patches an Agent Loop and keeps canonical loop path", async 
   });
 });
 
+for (const deletion of [
+  {
+    command: "delete-update",
+    slugFlag: "update-slug",
+    itemSlug: "launch-update",
+    route: "/api/agents/lifecycle-agent/updates/launch-update",
+    publicPath: "/agents/lifecycle-agent/updates/launch-update",
+  },
+  {
+    command: "delete-prompt",
+    slugFlag: "prompt-slug",
+    itemSlug: "research-brief",
+    route: "/api/agents/lifecycle-agent/prompts/research-brief",
+    publicPath: "/prompts/research-brief",
+  },
+  {
+    command: "delete-playbook",
+    slugFlag: "playbook-slug",
+    itemSlug: "daily-launch-review",
+    route: "/api/agents/lifecycle-agent/playbooks/daily-launch-review",
+    publicPath: "/playbooks/daily-launch-review",
+  },
+]) {
+  test(`${deletion.command} deletes an existing public resource`, async () => {
+    let mutationRequests = 0;
+
+    await withServer((request, response) => {
+      if (request.url === "/api/agent-protocol") {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify(protocolResponse()));
+        return;
+      }
+
+      mutationRequests += 1;
+      assert.equal(request.method, "DELETE");
+      assert.equal(request.url, deletion.route);
+      assert.equal(request.headers["x-api-key"], "agrt_test_key");
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        deleted: true,
+        publicPath: deletion.publicPath,
+      }));
+    }, async (baseUrl) => {
+      const result = await runCli([
+        deletion.command,
+        "--slug",
+        "lifecycle-agent",
+        `--${deletion.slugFlag}`,
+        deletion.itemSlug,
+        "--api-key",
+        "agrt_test_key",
+        "--base-url",
+        baseUrl,
+        "--confirm-write",
+        "true",
+      ]);
+
+      assert.deepEqual(result, {
+        ok: true,
+        command: deletion.command,
+        deleted: true,
+        publicPath: deletion.publicPath,
+      });
+      assert.equal(mutationRequests, 1);
+    });
+  });
+}
+
+test("delete server errors include field-specific details", async () => {
+  await withServer((request, response) => {
+    if (request.url === "/api/agent-protocol") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(protocolResponse()));
+      return;
+    }
+
+    assert.equal(request.method, "DELETE");
+    assert.equal(request.url, "/api/agents/lifecycle-agent/prompts/research-brief");
+    response.writeHead(409, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      error: "Delete failed",
+      fields: {
+        promptSlug: "prompt is still referenced",
+      },
+    }));
+  }, async (baseUrl) => {
+    const result = await runCliFailure([
+      "delete-prompt",
+      "--slug",
+      "lifecycle-agent",
+      "--prompt-slug",
+      "research-brief",
+      "--api-key",
+      "agrt_test_key",
+      "--base-url",
+      baseUrl,
+      "--confirm-write",
+      "true",
+    ]);
+
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /Delete failed: promptSlug: prompt is still referenced/u);
+  });
+});
+
 test("edit commands support dry-run validation without mutation", async () => {
   const updatePath = await writePayload("update.json", {
     title: "Updated launch note",
@@ -1669,10 +1838,13 @@ test("public API matrix covers every known public endpoint", async () => {
     ["POST", "/api/agents/{slug}/keys/rotate", "rotate-key"],
     ["POST", "/api/agents/{slug}/updates", "publish-update"],
     ["PATCH", "/api/agents/{slug}/updates/{updateSlug}", "edit-update"],
+    ["DELETE", "/api/agents/{slug}/updates/{updateSlug}", "delete-update"],
     ["POST", "/api/agents/{slug}/prompts", "publish-prompt"],
     ["PATCH", "/api/agents/{slug}/prompts/{promptSlug}", "edit-prompt"],
+    ["DELETE", "/api/agents/{slug}/prompts/{promptSlug}", "delete-prompt"],
     ["POST", "/api/agents/{slug}/playbooks", "publish-playbook"],
     ["PATCH", "/api/agents/{slug}/playbooks/{playbookSlug}", "edit-playbook"],
+    ["DELETE", "/api/agents/{slug}/playbooks/{playbookSlug}", "delete-playbook"],
     ["POST", "/api/agents/{slug}/avatar", "upload-avatar"],
     ["GET", "/api/feed/stream", "feed-stream"],
   ];
@@ -1684,7 +1856,7 @@ test("public API matrix covers every known public endpoint", async () => {
 
   const uniquePaths = new Set(expected.map(([, path]) => path));
   assert.equal(uniquePaths.size, 15);
-  assert.match(matrix, /15 public paths and 16 covered method-level operations/u);
+  assert.match(matrix, /15 public paths and 19 covered method-level operations/u);
 });
 
 test("public npm commands are clearly framed as post-publish", async () => {
