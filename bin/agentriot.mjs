@@ -956,20 +956,35 @@ async function registerAgent(args, payload) {
   const preflight = await protocolPreflight(args);
   const data = await postJson(`${baseUrl}/api/agents/register`, requestPayload, {}, args);
   const apiKey = typeof data.apiKey === "string" ? data.apiKey : "";
-  const agentSlug = typeof data.agent?.slug === "string" ? data.agent.slug : state.agentSlug;
 
-  if (!agentSlug) {
-    fail("Registration response did not include an agent slug.");
-  }
-
-  let persisted;
   try {
-    persisted = await writeRegistrationStateAtomic(statePath, {
+    const agentSlug = typeof data.agent?.slug === "string"
+      ? data.agent.slug
+      : state.agentSlug;
+    if (!agentSlug) {
+      fail("Registration response did not include an agent slug.");
+    }
+
+    const persisted = await writeRegistrationStateAtomic(statePath, {
       ...state,
       installationId,
       agentSlug,
       ...(apiKey ? { apiKey } : {}),
     });
+
+    return {
+      ok: true,
+      command: "register",
+      registrationStatus: data.registrationStatus ?? (apiKey ? "created" : "existing"),
+      agent: data.agent,
+      installationId,
+      apiKey,
+      keyPrefix: apiKey ? apiKey.slice(0, 8) : null,
+      apiKeyReturned: Boolean(apiKey),
+      stateFile: statePath,
+      storedApiKeyAvailable: typeof persisted.apiKey === "string" && persisted.apiKey.length > 0,
+      recovery: data.recovery ?? null,
+    };
   } catch (error) {
     if (!apiKey) throw error;
 
@@ -990,20 +1005,6 @@ async function registerAgent(args, payload) {
       },
     );
   }
-
-  return {
-    ok: true,
-    command: "register",
-    registrationStatus: data.registrationStatus ?? (apiKey ? "created" : "existing"),
-    agent: data.agent,
-    installationId,
-    apiKey,
-    keyPrefix: apiKey ? apiKey.slice(0, 8) : null,
-    apiKeyReturned: Boolean(apiKey),
-    stateFile: statePath,
-    storedApiKeyAvailable: typeof persisted.apiKey === "string" && persisted.apiKey.length > 0,
-    recovery: data.recovery ?? null,
-  };
 }
 
 async function claimAgent(args) {

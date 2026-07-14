@@ -105,3 +105,88 @@ node --check bin/lib/state.mjs
 Atomic rename and symbolic-link behavior are verified on the Linux filesystem
 used by the project test environment. No cross-platform filesystem test was
 requested or run.
+
+## Review rework TDD evidence
+
+The durability review identified five root causes in the initial change:
+
+- The writer synchronized file contents but not the parent-directory rename.
+- Temporary and final JSON verification reopened paths instead of retaining
+  file-handle identity.
+- Creation mode was subject to the process umask because the handle was not
+  explicitly changed to mode `0600`.
+- The missing-agent-slug check occurred outside the API-key recovery boundary.
+- The failure test stopped before temporary-file creation and therefore did
+  not prove cleanup after a later atomic-write failure.
+
+The second focused RED command was:
+
+```text
+node --test \
+  --test-name-pattern='state|registration persistence|registration response shape|symlink' \
+  tests/agentriot.test.mjs
+```
+
+Result before the review fixes: 8 tests passed and 6 tests failed. The failures
+were the restrictive-umask mode check, four tests requiring the internal state
+I/O seam and its directory-sync, no-follow, and post-temp-failure behavior,
+and missing-slug recovery for a returned API key.
+
+The same focused command after the fixes reported 14 tests passed, 0 failed,
+0 cancelled, and 0 skipped.
+
+The deterministic failure test injects a failing `rename` operation through
+`createRegistrationStateIO`. The injected operation runs only after the open
+temporary handle has been written, changed to mode `0600`, synchronized, and
+verified. The test confirms one rename attempt, no remaining temporary file,
+and byte-for-byte preservation of the prior destination state.
+
+## Durability and path-integrity policy
+
+The final implementation uses the following policy:
+
+1. Open the randomized same-directory temporary file with exclusive creation
+   and `O_NOFOLLOW` when the platform exposes that flag.
+2. Call `FileHandle.chmod(0o600)` before verifying the exact permission bits.
+3. Write, synchronize, inspect, and parse the temporary JSON through the same
+   open handle. No path-based temporary-file readback occurs.
+4. Rename the verified file and synchronize the parent directory before
+   reporting success or allowing registration to proceed to network access.
+5. Open the final path with `O_NOFOLLOW` when available, compare its device and
+   inode to the temporary handle when those values are meaningful, and compare
+   the complete parsed JSON object with the requested state.
+
+Directory durability is fail-closed. If the platform cannot open or synchronize
+the parent directory, the write returns an error; there is no silent best-effort
+fallback. A rename might already be visible when directory synchronization
+fails, but persistence is treated as unconfirmed. Before registration network
+access, that error stops the command. After a remote response containing an API
+key, it produces the structured nonzero recovery object on stdout and the fixed
+secret-free message on stderr.
+
+When `O_NOFOLLOW` is unavailable, the implementation uses a pre-open `lstat`,
+an open-handle `stat`, and a post-open `lstat`, and requires matching file
+identity when the platform supplies meaningful device and inode values. When
+stable device/inode identity is unavailable, regular-file type, exact mode, and
+full parsed-content verification still apply, but the implementation does not
+claim the same kernel-enforced no-follow or identity guarantee. Same-directory
+rename supplies atomic replacement only to the extent supported by the host
+filesystem.
+
+## Final verification evidence
+
+After the review fixes, the full regression command was:
+
+```text
+npm test
+```
+
+Result: 87 tests passed, 0 failed, 0 cancelled, and 0 skipped.
+
+The following checks also completed with exit code 0:
+
+```text
+git diff --check
+node --check bin/agentriot.mjs
+node --check bin/lib/state.mjs
+```

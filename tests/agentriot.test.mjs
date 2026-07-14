@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { constants as fsConstants } from "node:fs";
 import { chmod, mkdtemp, readFile, readdir, rename, stat, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -568,6 +569,125 @@ test("state atomic writes replace permissive files with owner-only permissions",
   });
 });
 
+test("state atomic writes chmod to exact 0600 under a restrictive umask", async () => {
+  const { writeRegistrationStateAtomic } = await import("../bin/lib/state.mjs");
+  const dir = await mkdtemp(join(tmpdir(), "agentriot-state-"));
+  const statePath = join(dir, "state.json");
+  const previousUmask = process.umask(0o777);
+
+  try {
+    await writeRegistrationStateAtomic(statePath, {
+      installationId: "install_restrictive_umask",
+    });
+  } finally {
+    process.umask(previousUmask);
+  }
+
+  assert.equal((await stat(statePath)).mode & 0o777, 0o600);
+});
+
+test("state atomic writes fsync the parent directory before success", async () => {
+  const { createRegistrationStateIO } = await import("../bin/lib/state.mjs");
+  const realFileSystem = await import("node:fs/promises");
+  const dir = await mkdtemp(join(tmpdir(), "agentriot-state-"));
+  const statePath = join(dir, "state.json");
+  let directorySyncs = 0;
+  const stateIO = createRegistrationStateIO({
+    open: async (filePath, flags, mode) => {
+      if (filePath === dir) {
+        return {
+          async close() {},
+          async sync() {
+            directorySyncs += 1;
+          },
+        };
+      }
+      return realFileSystem.open(filePath, flags, mode);
+    },
+  });
+
+  await stateIO.writeRegistrationStateAtomic(statePath, {
+    installationId: "install_directory_sync",
+  });
+
+  assert.equal(directorySyncs, 1);
+});
+
+test("state atomic writes fail closed when directory fsync is unsupported", async () => {
+  const { createRegistrationStateIO } = await import("../bin/lib/state.mjs");
+  const realFileSystem = await import("node:fs/promises");
+  const dir = await mkdtemp(join(tmpdir(), "agentriot-state-"));
+  const statePath = join(dir, "state.json");
+  const unsupported = Object.assign(new Error("directory sync unsupported"), {
+    code: "ENOTSUP",
+  });
+  const stateIO = createRegistrationStateIO({
+    open: async (filePath, flags, mode) => {
+      if (filePath === dir) throw unsupported;
+      return realFileSystem.open(filePath, flags, mode);
+    },
+  });
+
+  await assert.rejects(
+    stateIO.writeRegistrationStateAtomic(statePath, {
+      installationId: "install_directory_sync_required",
+    }),
+    /directory durability sync is required.*ENOTSUP/u,
+  );
+});
+
+test("state file opens use no-follow protection when the platform provides it", async () => {
+  const { createRegistrationStateIO } = await import("../bin/lib/state.mjs");
+  const realFileSystem = await import("node:fs/promises");
+  const dir = await mkdtemp(join(tmpdir(), "agentriot-state-"));
+  const statePath = join(dir, "state.json");
+  const openedStateFlags = [];
+  const stateIO = createRegistrationStateIO({
+    open: async (filePath, flags, mode) => {
+      if (filePath === statePath) openedStateFlags.push(flags);
+      return realFileSystem.open(filePath, flags, mode);
+    },
+  });
+
+  await stateIO.writeRegistrationStateAtomic(statePath, {
+    installationId: "install_no_follow",
+  });
+  await stateIO.readRegistrationState(statePath, { required: true });
+
+  if (fsConstants.O_NOFOLLOW) {
+    assert.ok(openedStateFlags.length >= 2);
+    for (const flags of openedStateFlags) {
+      assert.equal(flags & fsConstants.O_NOFOLLOW, fsConstants.O_NOFOLLOW);
+    }
+  }
+});
+
+test("state atomic post-temp failure removes temp and preserves prior state", async () => {
+  const { createRegistrationStateIO } = await import("../bin/lib/state.mjs");
+  const dir = await mkdtemp(join(tmpdir(), "agentriot-state-"));
+  const statePath = join(dir, "state.json");
+  const original = '{"installationId":"install_existing"}\n';
+  let renameCalls = 0;
+  await writeFile(statePath, original, { encoding: "utf8", mode: 0o600 });
+  const stateIO = createRegistrationStateIO({
+    rename: async () => {
+      renameCalls += 1;
+      throw Object.assign(new Error("injected rename failure"), { code: "EIO" });
+    },
+  });
+
+  await assert.rejects(
+    stateIO.writeRegistrationStateAtomic(statePath, {
+      installationId: "install_replacement",
+    }),
+    /injected rename failure/u,
+  );
+
+  assert.equal(renameCalls, 1);
+  assert.equal(await readFile(statePath, "utf8"), original);
+  assert.deepEqual(await readdir(dir), ["state.json"]);
+});
+
 test("state atomic write failure preserves the complete prior file", async () => {
   const { writeRegistrationStateAtomic } = await import("../bin/lib/state.mjs");
   const dir = await mkdtemp(join(tmpdir(), "agentriot-state-"));
@@ -692,6 +812,50 @@ test("registration persistence failure returns the one-time key only in recovery
   });
 
   assert.deepEqual(await readJsonFile(symlinkTarget), { untouched: true });
+});
+
+test("registration response shape failure recovers a returned one-time key on stdout", async () => {
+  const inputPath = await writePayload("register.json", {
+    name: "Lifecycle Agent",
+    tagline: "Uses AgentRiot.",
+    description: "Exercises registration.",
+  });
+  const statePath = `${inputPath}.agentriot-state.json`;
+  const oneTimeKey = "agrt_missing_slug_recovery_key";
+
+  await withServer((request, response) => {
+    if (request.url === "/api/agent-protocol") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(protocolResponse()));
+      return;
+    }
+
+    assert.equal(request.url, "/api/agents/register");
+    response.writeHead(201, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      registrationStatus: "created",
+      agent: { id: "agt_1", name: "Lifecycle Agent" },
+      apiKey: oneTimeKey,
+    }));
+  }, async (baseUrl) => {
+    const failure = await runCliFailure([
+      "register",
+      "--input",
+      inputPath,
+      "--base-url",
+      baseUrl,
+      "--confirm-write",
+      "true",
+    ]);
+    const recovery = JSON.parse(failure.stdout);
+
+    assert.equal(failure.code, 1);
+    assert.equal(recovery.statePersisted, false);
+    assert.equal(recovery.apiKey, oneTimeKey);
+    assert.equal(recovery.stateFile, statePath);
+    assert.equal(failure.stderr.includes(oneTimeKey), false);
+    assert.match(failure.stderr, /Registration succeeded, but credential state could not be persisted/u);
+  });
 });
 
 test("register writes credential state with owner-only permissions", async () => {
