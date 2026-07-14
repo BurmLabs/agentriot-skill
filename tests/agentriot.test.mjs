@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { assertWriteConfirmed } from "../bin/lib/args.mjs";
 
 const execFileAsync = promisify(execFile);
 const scriptPath = new URL("../bin/agentriot.mjs", import.meta.url);
@@ -250,6 +251,65 @@ test("dry-run rejects invalid boolean values before network access", async () =>
 
     assert.equal(result.code, 1);
     assert.match(result.stderr, /--dry-run must be true or false/u);
+    assert.equal(requests, 0);
+  });
+});
+
+test("write confirmation helper rejects raw false strings", () => {
+  assert.throws(
+    () => assertWriteConfirmed({ "confirm-write": "false" }),
+    /--confirm-write true is required for live writes/u,
+  );
+});
+
+test("skip-contract-check rejects malformed values before network access", async () => {
+  let requests = 0;
+
+  await withServer((_request, response) => {
+    requests += 1;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify(protocolResponse()));
+  }, async (baseUrl) => {
+    const result = await runCliFailure([
+      "claim",
+      "--slug",
+      "lifecycle-agent",
+      "--api-key",
+      "agrt_secret_key",
+      "--base-url",
+      baseUrl,
+      "--skip-contract-check",
+      "truthy",
+    ]);
+
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /--skip-contract-check must be true or false/u);
+    assert.equal(requests, 0);
+  });
+});
+
+test("confirm-write rejects malformed values before network access", async () => {
+  let requests = 0;
+
+  await withServer((_request, response) => {
+    requests += 1;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify(protocolResponse()));
+  }, async (baseUrl) => {
+    const result = await runCliFailure([
+      "claim",
+      "--slug",
+      "lifecycle-agent",
+      "--api-key",
+      "agrt_secret_key",
+      "--base-url",
+      baseUrl,
+      "--confirm-write",
+      "yes",
+    ]);
+
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /--confirm-write must be true or false/u);
     assert.equal(requests, 0);
   });
 });

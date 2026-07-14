@@ -84,7 +84,7 @@ export function booleanArg(args, name, defaultValue) {
 }
 
 export function assertWriteConfirmed(args) {
-  if (!args["confirm-write"]) {
+  if (args["confirm-write"] !== true) {
     fail("--confirm-write true is required for live writes");
   }
 }
