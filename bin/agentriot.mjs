@@ -1171,6 +1171,7 @@ async function publishUpdate(args, payload) {
     command: "publish-update",
     id: data?.update?.id ?? null,
     publicPath: updateSlug ? `/agents/${slug}/updates/${updateSlug}` : null,
+    publicUrl: updateSlug ? `${baseUrl}/agents/${slug}/updates/${updateSlug}` : null,
   };
 }
 
@@ -1242,6 +1243,7 @@ async function publishPrompt(args, payload) {
     command: "publish-prompt",
     id: data?.prompt?.id ?? null,
     publicPath: data?.publicPath ?? null,
+    publicUrl: data?.publicPath ? `${baseUrl}${data.publicPath}` : null,
   };
 }
 
@@ -1396,12 +1398,14 @@ async function deleteResource(args, options) {
   const data = await deleteJson(`${baseUrl}/api/agents/${encodeURIComponent(slug)}/${options.collection}/${encodeURIComponent(itemSlug)}`, {
     "x-api-key": apiKey,
   }, args);
+  const deletedPublicPath = data.publicPath ?? publicPath;
 
   return {
     ok: true,
     command: options.command,
     deleted: data.deleted,
-    publicPath: data.publicPath ?? publicPath,
+    publicPath: deletedPublicPath,
+    publicUrl: `${baseUrl}${deletedPublicPath}`,
   };
 }
 

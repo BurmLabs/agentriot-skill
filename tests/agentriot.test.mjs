@@ -1635,6 +1635,231 @@ test("state command fails when the requested state file is missing", async () =>
   assert.match(result.stderr, /Registration state file not found/u);
 });
 
+const SUCCESS_COMMAND_CASES = [
+  {
+    command: "claim",
+    method: "POST",
+    route: "/api/agents/claim",
+    args: ["--slug", "lifecycle-agent", "--api-key", "agrt_test_key", "--email", "owner@example.com"],
+    requestBody: {
+      agentSlug: "lifecycle-agent",
+      apiKey: "agrt_test_key",
+      email: "owner@example.com",
+    },
+    response: {
+      claimed: true,
+      agentId: "agt_1",
+      email: "owner@example.com",
+      recoveryToken: "recovery_test_token",
+    },
+    expected: {
+      ok: true,
+      command: "claim",
+      claimed: true,
+      agentId: "agt_1",
+      email: "owner@example.com",
+      recoveryToken: "recovery_test_token",
+    },
+  },
+  {
+    command: "rotate-key",
+    method: "POST",
+    route: "/api/agents/lifecycle-agent/keys/rotate",
+    args: ["--slug", "lifecycle-agent", "--api-key", "agrt_test_key"],
+    requestBody: { apiKey: "agrt_test_key" },
+    response: {
+      agent: { id: "agt_1", slug: "lifecycle-agent" },
+      apiKey: "agrt_rotated_key",
+      keyPrefix: "agrt_rot",
+      recoveryToken: "recovery_rotated_token",
+    },
+    expected: {
+      ok: true,
+      command: "rotate-key",
+      agent: { id: "agt_1", slug: "lifecycle-agent" },
+      apiKey: "agrt_rotated_key",
+      keyPrefix: "agrt_rot",
+      recoveryToken: "recovery_rotated_token",
+    },
+  },
+  {
+    command: "get-profile",
+    method: "GET",
+    route: "/api/agents/lifecycle-agent",
+    args: ["--slug", "lifecycle-agent"],
+    response: {
+      profile: { slug: "lifecycle-agent", name: "Lifecycle Agent" },
+    },
+    expected: {
+      ok: true,
+      command: "get-profile",
+      profile: { slug: "lifecycle-agent", name: "Lifecycle Agent" },
+      publicPath: "/agents/lifecycle-agent",
+    },
+  },
+  {
+    command: "update-profile",
+    method: "PATCH",
+    route: "/api/agents/lifecycle-agent",
+    args: ["--slug", "lifecycle-agent", "--api-key", "agrt_test_key"],
+    payload: { tagline: "Updated lifecycle profile" },
+    response: {
+      profile: { slug: "lifecycle-agent", tagline: "Updated lifecycle profile" },
+    },
+    expected: {
+      ok: true,
+      command: "update-profile",
+      profile: { slug: "lifecycle-agent", tagline: "Updated lifecycle profile" },
+      publicPath: "/agents/lifecycle-agent",
+    },
+  },
+  {
+    command: "publish-update",
+    method: "POST",
+    route: "/api/agents/lifecycle-agent/updates",
+    args: ["--slug", "lifecycle-agent", "--api-key", "agrt_test_key"],
+    payload: {
+      title: "Lifecycle launch",
+      summary: "Published the lifecycle release.",
+      whatChanged: "Added portable release verification.",
+      signalType: "launch",
+    },
+    response: {
+      update: { id: "update_1", slug: "lifecycle-launch" },
+    },
+    expected: {
+      ok: true,
+      command: "publish-update",
+      id: "update_1",
+      publicPath: "/agents/lifecycle-agent/updates/lifecycle-launch",
+    },
+  },
+  {
+    command: "publish-prompt",
+    method: "POST",
+    route: "/api/agents/lifecycle-agent/prompts",
+    args: ["--slug", "lifecycle-agent", "--api-key", "agrt_test_key"],
+    payload: {
+      title: "Lifecycle summary",
+      description: "Summarizes lifecycle evidence.",
+      prompt: "Summarize the lifecycle evidence.",
+      expectedOutput: "A concise lifecycle summary.",
+    },
+    response: {
+      prompt: { id: "prompt_1", slug: "lifecycle-summary" },
+      publicPath: "/prompts/lifecycle-summary",
+    },
+    expected: {
+      ok: true,
+      command: "publish-prompt",
+      id: "prompt_1",
+      publicPath: "/prompts/lifecycle-summary",
+    },
+  },
+];
+
+test("core public commands preserve their route, auth, request, preflight, and response contracts", async (t) => {
+  for (const commandCase of SUCCESS_COMMAND_CASES) {
+    await t.test(commandCase.command, async () => {
+      const inputPath = commandCase.payload
+        ? await writePayload(`${commandCase.command}.json`, commandCase.payload)
+        : null;
+      let preflightRequests = 0;
+      let operationRequests = 0;
+
+      await withServer(async (request, response) => {
+        if (request.url === "/api/agent-protocol") {
+          preflightRequests += 1;
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end(JSON.stringify(protocolResponse()));
+          return;
+        }
+
+        operationRequests += 1;
+        assert.equal(request.method, commandCase.method);
+        assert.equal(request.url, commandCase.route);
+        assert.equal(
+          request.headers["x-api-key"],
+          ["update-profile", "publish-update", "publish-prompt"].includes(commandCase.command)
+            ? "agrt_test_key"
+            : undefined,
+        );
+        if (commandCase.requestBody || commandCase.payload) {
+          assert.deepEqual(
+            JSON.parse(await readRequestBody(request)),
+            commandCase.requestBody ?? commandCase.payload,
+          );
+        }
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify(commandCase.response));
+      }, async (baseUrl) => {
+        const result = await runCli([
+          commandCase.command,
+          ...commandCase.args,
+          ...(inputPath ? ["--input", inputPath] : []),
+          "--base-url",
+          baseUrl,
+          ...(["get-profile"].includes(commandCase.command) ? [] : ["--confirm-write", "true"]),
+        ]);
+
+        assert.deepEqual(result, {
+          ...commandCase.expected,
+          ...("publicPath" in commandCase.expected
+            ? { publicUrl: `${baseUrl}${commandCase.expected.publicPath}` }
+            : {}),
+        });
+        assert.equal(preflightRequests, commandCase.command === "get-profile" ? 0 : 1);
+        assert.equal(operationRequests, 1);
+      });
+    });
+  }
+});
+
+test("core public writes support dry-run and reject missing confirmation without mutation", async (t) => {
+  const writeCases = SUCCESS_COMMAND_CASES.filter(({ command }) => command !== "get-profile");
+
+  for (const commandCase of writeCases) {
+    await t.test(commandCase.command, async () => {
+      const inputPath = commandCase.payload
+        ? await writePayload(`${commandCase.command}.json`, commandCase.payload)
+        : null;
+      let preflightRequests = 0;
+      let operationRequests = 0;
+
+      await withServer((request, response) => {
+        if (request.url === "/api/agent-protocol") {
+          preflightRequests += 1;
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end(JSON.stringify(protocolResponse()));
+          return;
+        }
+
+        operationRequests += 1;
+        response.writeHead(500, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: "unexpected mutation" }));
+      }, async (baseUrl) => {
+        const baseArgs = [
+          commandCase.command,
+          ...commandCase.args,
+          ...(inputPath ? ["--input", inputPath] : []),
+          "--base-url",
+          baseUrl,
+        ];
+        const dryRun = await runCli([...baseArgs, "--dry-run", "true"]);
+        const missingConfirmation = await runCliFailure(baseArgs);
+
+        assert.equal(dryRun.ok, true);
+        assert.equal(dryRun.command, commandCase.command);
+        assert.equal(dryRun.dryRun, true);
+        assert.equal(dryRun.contractVersion, "2026.05.16");
+        assert.match(missingConfirmation.stderr, /--confirm-write true is required for live writes/u);
+        assert.equal(preflightRequests, 2);
+        assert.equal(operationRequests, 0);
+      });
+    });
+  }
+});
+
 test("server validation errors include field-specific details", async () => {
   const inputPath = await writePayload("prompt.json", {
     title: "Research brief prompt",
@@ -2067,6 +2292,7 @@ for (const deletion of DELETE_CASES) {
         command: deletion.command,
         deleted: true,
         publicPath: deletion.publicPath,
+        publicUrl: `${baseUrl}${deletion.publicPath}`,
       });
       assert.equal(mutationRequests, 1);
     });
