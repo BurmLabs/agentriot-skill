@@ -66,7 +66,13 @@ function readJpegDimensions(buffer) {
 
 function readWebpChunkDimensions(buffer, chunkType, dataOffset, chunkSize) {
   if (chunkType === "VP8X") {
-    if (chunkSize !== 10) malformed("WebP");
+    if (chunkSize !== 10
+      || (buffer[dataOffset] & ~0x3e) !== 0
+      || buffer[dataOffset + 1] !== 0
+      || buffer[dataOffset + 2] !== 0
+      || buffer[dataOffset + 3] !== 0) {
+      malformed("WebP");
+    }
     return positiveDimensions(
       buffer.readUIntLE(dataOffset + 4, 3) + 1,
       buffer.readUIntLE(dataOffset + 7, 3) + 1,
@@ -77,6 +83,7 @@ function readWebpChunkDimensions(buffer, chunkType, dataOffset, chunkSize) {
   if (chunkType === "VP8L") {
     if (chunkSize < 5 || buffer[dataOffset] !== 0x2f) malformed("WebP");
     const dimensions = buffer.readUInt32LE(dataOffset + 1);
+    if ((dimensions >>> 29) !== 0) malformed("WebP");
     return positiveDimensions(
       (dimensions & 0x3fff) + 1,
       ((dimensions >>> 14) & 0x3fff) + 1,
@@ -86,6 +93,7 @@ function readWebpChunkDimensions(buffer, chunkType, dataOffset, chunkSize) {
 
   if (chunkType === "VP8 ") {
     if (chunkSize < 10
+      || (buffer[dataOffset] & 0x01) !== 0
       || buffer[dataOffset + 3] !== 0x9d
       || buffer[dataOffset + 4] !== 0x01
       || buffer[dataOffset + 5] !== 0x2a) {

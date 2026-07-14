@@ -101,16 +101,18 @@ function webpRiff(chunkType, chunkData) {
   return buffer;
 }
 
-function webpVp8xFixture(width, height) {
+function webpVp8xFixture(width, height, options = {}) {
   const chunkData = Buffer.alloc(10);
+  chunkData[0] = options.flags ?? 0;
+  Buffer.from(options.reservedBytes ?? [0, 0, 0]).copy(chunkData, 1);
   chunkData.writeUIntLE(width - 1, 4, 3);
   chunkData.writeUIntLE(height - 1, 7, 3);
   return webpRiff("VP8X", chunkData);
 }
 
-function webpVp8Fixture(width, height) {
+function webpVp8Fixture(width, height, options = {}) {
   const chunkData = Buffer.from([
-    0x00, 0x00, 0x00,
+    options.frameTag ?? 0x00, 0x00, 0x00,
     0x9d, 0x01, 0x2a,
     0x00, 0x00,
     0x00, 0x00,
@@ -120,10 +122,12 @@ function webpVp8Fixture(width, height) {
   return webpRiff("VP8 ", chunkData);
 }
 
-function webpVp8lFixture(width, height) {
+function webpVp8lFixture(width, height, options = {}) {
   const chunkData = Buffer.alloc(5);
   chunkData[0] = 0x2f;
-  const dimensions = BigInt(width - 1) | (BigInt(height - 1) << 14n);
+  const dimensions = BigInt(width - 1)
+    | (BigInt(height - 1) << 14n)
+    | (BigInt(options.version ?? 0) << 29n);
   chunkData.writeUInt32LE(Number(dimensions), 1);
   return webpRiff("VP8L", chunkData);
 }
@@ -1187,11 +1191,15 @@ test("upload-avatar accepts PNG, JPEG, and WebP dimensions at inclusive boundari
   });
 });
 
-test("upload-avatar rejects malformed and out-of-range dimensions before preflight", async () => {
+test("upload-avatar rejects malformed and out-of-range dimensions before preflight", async (t) => {
   const fixtures = [
     ["too-small.png", pngFixture(1, 1), /between 128 and 2048 pixels/u],
     ["too-wide.jpg", jpegFixture(4096, 128), /between 128 and 2048 pixels/u],
     ["truncated.webp", webpVp8xFixture(256, 256).subarray(0, 24), /Malformed WebP image/u],
+    ["vp8-inter-frame.webp", webpVp8Fixture(256, 256, { frameTag: 0x01 }), /Malformed WebP image/u],
+    ["vp8l-version.webp", webpVp8lFixture(256, 256, { version: 1 }), /Malformed WebP image/u],
+    ["vp8x-reserved-flag.webp", webpVp8xFixture(256, 256, { flags: 0x01 }), /Malformed WebP image/u],
+    ["vp8x-reserved-byte.webp", webpVp8xFixture(256, 256, { reservedBytes: [0x01, 0x00, 0x00] }), /Malformed WebP image/u],
     ["signature-only.png", Buffer.from("89504e470d0a1a0a", "hex"), /Malformed PNG image/u],
     ["signature-only.jpg", Buffer.from("ffd8ff", "hex"), /Malformed JPEG image/u],
     ["signature-only.webp", Buffer.from("524946460000000057454250", "hex"), /Malformed WebP image/u],
@@ -1204,23 +1212,25 @@ test("upload-avatar rejects malformed and out-of-range dimensions before preflig
     response.end(JSON.stringify(protocolResponse()));
   }, async (baseUrl) => {
     for (const [name, contents, expectedError] of fixtures) {
-      const avatarPath = await writeTempFile(name, contents);
-      const result = await runCliFailure([
-        "upload-avatar",
-        "--file",
-        avatarPath,
-        "--slug",
-        "lifecycle-agent",
-        "--api-key",
-        "agrt_secret_key",
-        "--base-url",
-        baseUrl,
-        "--dry-run",
-        "true",
-      ]);
+      await t.test(name, async () => {
+        const avatarPath = await writeTempFile(name, contents);
+        const result = await runCliFailure([
+          "upload-avatar",
+          "--file",
+          avatarPath,
+          "--slug",
+          "lifecycle-agent",
+          "--api-key",
+          "agrt_secret_key",
+          "--base-url",
+          baseUrl,
+          "--dry-run",
+          "true",
+        ]);
 
-      assert.equal(result.code, 1);
-      assert.match(result.stderr, expectedError);
+        assert.equal(result.code, 1);
+        assert.match(result.stderr, expectedError);
+      });
     }
   });
 
