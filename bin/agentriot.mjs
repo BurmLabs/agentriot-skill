@@ -10,6 +10,7 @@ import {
 
 const DEFAULT_BASE_URL = "https://agentriot.com";
 const DEFAULT_TIMEOUT_MS = 30000;
+const MAX_SERVER_ERROR_LENGTH = 512;
 const LOCAL_SKILL_NAME = "agentriot";
 const LOCAL_SKILL_VERSION = "0.10.1";
 const CONTRACT_VERSION = "2026.05.16";
@@ -244,7 +245,28 @@ function fieldPath(detail) {
   return null;
 }
 
-function normalizeServerError(data, status) {
+function sanitizeServerError(message, args) {
+  const { apiKey, recoveryToken } = config(args);
+  const configuredSecrets = [apiKey, recoveryToken]
+    .filter((secret) => typeof secret === "string" && secret.length > 0)
+    .sort((left, right) => right.length - left.length);
+  let sanitized = String(message);
+
+  for (const secret of configuredSecrets) {
+    sanitized = sanitized.split(secret).join("[REDACTED]");
+  }
+
+  sanitized = sanitized
+    .replace(/\b(https?:\/\/)[^/\s@]+@/giu, "$1[REDACTED]@")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/giu, "Bearer [REDACTED]")
+    .replace(/\b(?:agrt|sk)[_-][A-Za-z0-9._~+/=-]{6,}/giu, "[REDACTED]")
+    .replace(/(\b(?:api[-_]?key|x-api-key|recovery[-_]?token)\b["']?\s*[:=]\s*["']?)([^"',;\s}\]]+)/giu, "$1[REDACTED]");
+
+  if (sanitized.length <= MAX_SERVER_ERROR_LENGTH) return sanitized;
+  return `${sanitized.slice(0, MAX_SERVER_ERROR_LENGTH - 1)}…`;
+}
+
+function normalizeServerError(data, status, args = {}) {
   const base = typeof data.error === "string" ? data.error : `Request failed with ${status}`;
   const details = [];
 
@@ -267,7 +289,8 @@ function normalizeServerError(data, status) {
     }
   }
 
-  return details.length > 0 ? `${base}: ${details.join("; ")}` : base;
+  const normalized = details.length > 0 ? `${base}: ${details.join("; ")}` : base;
+  return sanitizeServerError(normalized, args);
 }
 
 async function fetchWithTimeout(url, options = {}, args = {}) {
@@ -298,7 +321,7 @@ async function postJson(url, payload, headers = {}, args = {}) {
   const data = await response.json().catch(() => ({}));
 
   if (!response.ok) {
-    fail(normalizeServerError(data, response.status));
+    fail(normalizeServerError(data, response.status, args));
   }
 
   return data;
@@ -316,7 +339,7 @@ async function patchJson(url, payload, headers = {}, args = {}) {
   const data = await response.json().catch(() => ({}));
 
   if (!response.ok) {
-    fail(normalizeServerError(data, response.status));
+    fail(normalizeServerError(data, response.status, args));
   }
 
   return data;
@@ -330,7 +353,7 @@ async function deleteJson(url, headers = {}, args = {}) {
   const data = await response.json().catch(() => ({}));
 
   if (!response.ok) {
-    fail(normalizeServerError(data, response.status));
+    fail(normalizeServerError(data, response.status, args));
   }
 
   return data;
@@ -341,7 +364,7 @@ async function getJson(url, args = {}) {
   const data = await response.json().catch(() => ({}));
 
   if (!response.ok) {
-    fail(normalizeServerError(data, response.status));
+    fail(normalizeServerError(data, response.status, args));
   }
 
   return data;
@@ -419,7 +442,7 @@ async function postMultipart(url, formData, headers = {}, args = {}) {
   const data = await response.json().catch(() => ({}));
 
   if (!response.ok) {
-    fail(normalizeServerError(data, response.status));
+    fail(normalizeServerError(data, response.status, args));
   }
 
   return data;
@@ -1514,7 +1537,7 @@ async function feedStream(args) {
 
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));
-    fail(normalizeServerError(data, response.status));
+    fail(normalizeServerError(data, response.status, args));
   }
 
   if (!response.body) {

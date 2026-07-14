@@ -44,9 +44,15 @@ async function runCli(args) {
   return JSON.parse(stdout);
 }
 
-async function runCliFailure(args) {
+async function runCliFailure(args, options = {}) {
   try {
-    await execFileAsync("node", [scriptPath.pathname, ...args]);
+    await execFileAsync("node", [scriptPath.pathname, ...args], {
+      ...options,
+      env: {
+        ...process.env,
+        ...options.env,
+      },
+    });
   } catch (error) {
     return {
       code: error.code,
@@ -1519,7 +1525,7 @@ test("edit-playbook patches an Agent Loop and keeps canonical loop path", async 
   });
 });
 
-for (const deletion of [
+const DELETE_CASES = [
   {
     command: "delete-update",
     slugFlag: "update-slug",
@@ -1541,7 +1547,9 @@ for (const deletion of [
     route: "/api/agents/lifecycle-agent/playbooks/daily-launch-review",
     publicPath: "/playbooks/daily-launch-review",
   },
-]) {
+];
+
+for (const deletion of DELETE_CASES) {
   test(`${deletion.command} deletes an existing public resource`, async () => {
     let mutationRequests = 0;
 
@@ -1622,6 +1630,142 @@ test("delete server errors include field-specific details", async () => {
     assert.equal(result.code, 1);
     assert.match(result.stderr, /Delete failed: promptSlug: prompt is still referenced/u);
   });
+});
+
+test("delete error sanitizes reflected secrets and bounds stderr", async () => {
+  const apiKey = "agrt_exact_configured_api_secret";
+  const recoveryToken = "recovery_exact_configured_secret";
+  const reflectedBearer = "eyJhbGciOiJIUzI1NiJ9.reflected.signature";
+  const reflectedApiKey = "agrt_server_reflected_secret";
+
+  await withServer((request, response) => {
+    if (request.url === "/api/agent-protocol") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(protocolResponse()));
+      return;
+    }
+
+    assert.equal(request.method, "DELETE");
+    response.writeHead(400, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      error: `Rejected ${apiKey} and ${recoveryToken}`,
+      details: [
+        `Fetch https://alice:password@example.com/private with Bearer ${reflectedBearer}`,
+        { field: "apiKey", message: reflectedApiKey },
+        { field: "payload", message: "x".repeat(4000) },
+      ],
+    }));
+  }, async (baseUrl) => {
+    const result = await runCliFailure([
+      "delete-update",
+      "--slug",
+      "lifecycle-agent",
+      "--update-slug",
+      "launch-update",
+      "--api-key",
+      apiKey,
+      "--base-url",
+      baseUrl,
+      "--confirm-write",
+      "true",
+    ], {
+      env: {
+        AGENTRIOT_RECOVERY_TOKEN: recoveryToken,
+      },
+    });
+
+    assert.equal(result.code, 1);
+    assert.equal(result.stderr.includes(apiKey), false);
+    assert.equal(result.stderr.includes(recoveryToken), false);
+    assert.equal(result.stderr.includes("alice"), false);
+    assert.equal(result.stderr.includes("password"), false);
+    assert.equal(result.stderr.includes(reflectedBearer), false);
+    assert.equal(result.stderr.includes(reflectedApiKey), false);
+    assert.ok(result.stderr.length <= 513, `stderr length was ${result.stderr.length}`);
+    assert.match(result.stderr, /\[REDACTED\]/u);
+  });
+});
+
+test("delete dry-run performs only protocol preflight for all commands", async () => {
+  for (const deletion of DELETE_CASES) {
+    let preflightRequests = 0;
+    let deleteRequests = 0;
+
+    await withServer((request, response) => {
+      if (request.url === "/api/agent-protocol") {
+        preflightRequests += 1;
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify(protocolResponse()));
+        return;
+      }
+
+      if (request.method === "DELETE") deleteRequests += 1;
+      response.writeHead(500, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: "unexpected mutation" }));
+    }, async (baseUrl) => {
+      const result = await runCli([
+        deletion.command,
+        "--slug",
+        "lifecycle-agent",
+        `--${deletion.slugFlag}`,
+        deletion.itemSlug,
+        "--api-key",
+        "agrt_test_key",
+        "--base-url",
+        baseUrl,
+        "--dry-run",
+        "true",
+      ]);
+
+      assert.equal(result.command, deletion.command);
+      assert.equal(result.dryRun, true);
+      assert.equal(preflightRequests, 1);
+      assert.equal(deleteRequests, 0);
+    });
+  }
+});
+
+test("delete confirmation rejects missing and false values without DELETE", async () => {
+  for (const deletion of DELETE_CASES) {
+    let preflightRequests = 0;
+    let deleteRequests = 0;
+
+    await withServer((request, response) => {
+      if (request.url === "/api/agent-protocol") {
+        preflightRequests += 1;
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify(protocolResponse()));
+        return;
+      }
+
+      if (request.method === "DELETE") deleteRequests += 1;
+      response.writeHead(500, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: "unexpected mutation" }));
+    }, async (baseUrl) => {
+      const baseArgs = [
+        deletion.command,
+        "--slug",
+        "lifecycle-agent",
+        `--${deletion.slugFlag}`,
+        deletion.itemSlug,
+        "--api-key",
+        "agrt_test_key",
+        "--base-url",
+        baseUrl,
+      ];
+      const missing = await runCliFailure(baseArgs);
+      const explicitlyFalse = await runCliFailure([
+        ...baseArgs,
+        "--confirm-write",
+        "false",
+      ]);
+
+      assert.match(missing.stderr, /--confirm-write true is required for live writes/u);
+      assert.match(explicitlyFalse.stderr, /--confirm-write true is required for live writes/u);
+      assert.equal(preflightRequests, 2);
+      assert.equal(deleteRequests, 0);
+    });
+  }
 });
 
 test("edit commands support dry-run validation without mutation", async () => {
