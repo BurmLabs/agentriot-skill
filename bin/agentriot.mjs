@@ -1,12 +1,11 @@
 #!/usr/bin/env node
-import { readFile, stat } from "node:fs/promises";
-import { basename, extname } from "node:path";
+import { readFile } from "node:fs/promises";
 import {
   assertWriteConfirmed,
   booleanArg,
   parseArgs,
 } from "./lib/args.mjs";
-import { readImageDimensions } from "./lib/image-dimensions.mjs";
+import { avatarLimits, readAvatarFile } from "./lib/avatar.mjs";
 import {
   maskCredential,
   maskValue,
@@ -18,18 +17,14 @@ import {
 const DEFAULT_BASE_URL = "https://agentriot.com";
 const DEFAULT_TIMEOUT_MS = 30000;
 const MAX_SERVER_ERROR_LENGTH = 512;
+const MAX_JSON_RESPONSE_BYTES = 1024 * 1024;
+const MAX_SSE_EVENT_BYTES = 256 * 1024;
+const MAX_SSE_PENDING_BYTES = 512 * 1024;
+const MAX_SSE_AGGREGATE_BYTES = 2 * 1024 * 1024;
 const LOCAL_SKILL_NAME = "agentriot";
 const LOCAL_SKILL_VERSION = "0.11.0";
 const CONTRACT_VERSION = "2026.05.16";
-const AVATAR_MAX_BYTES = 2 * 1024 * 1024;
-const AVATAR_MIN_DIMENSION = 128;
-const AVATAR_MAX_DIMENSION = 2048;
-const AVATAR_CONTENT_TYPES = Object.freeze({
-  ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg",
-  ".png": "image/png",
-  ".webp": "image/webp",
-});
+const AVATAR_MAX_BYTES = avatarLimits.maxBytes;
 const CONTRACT_LIMITS = Object.freeze({
   prompt: Object.freeze({
     title: 120,
@@ -72,6 +67,7 @@ const CONTRACT_LIMITS = Object.freeze({
 const VALIDATION_TYPES = new Set(["profile", "update", "prompt", "playbook", "loop", "register"]);
 const WRITE_COMMANDS = new Set(["register", "update-profile", "publish-update", "edit-update", "delete-update", "publish-prompt", "edit-prompt", "delete-prompt", "publish-playbook", "edit-playbook", "delete-playbook", "upload-avatar", "claim", "rotate-key"]);
 const CREDENTIAL_COMMANDS = new Set(["register", "update-profile", "publish-update", "edit-update", "delete-update", "publish-prompt", "edit-prompt", "delete-prompt", "publish-playbook", "edit-playbook", "delete-playbook", "upload-avatar", "claim", "rotate-key", "mcp-config"]);
+const BASE_URL_COMMANDS = new Set(["check-updates", "lookup-software", "profile", "mcp-config", "get-profile", "feed-stream", ...WRITE_COMMANDS]);
 const AGENT_SIGNAL_TYPES = new Set([
   "major_release",
   "launch",
@@ -140,8 +136,40 @@ function assertObject(payload) {
   }
 }
 
+function normalizedPayloadKey(key) {
+  return String(key).toLowerCase().replace(/[^a-z0-9]/gu, "");
+}
+
+function isSensitivePayloadKey(key) {
+  const normalized = normalizedPayloadKey(key);
+  return ["apikey", "recoverytoken", "authorization", "password", "secret", "token"]
+    .some((stem) => normalized === stem
+      || normalized.startsWith(stem)
+      || normalized.endsWith(stem));
+}
+
+function assertNoSensitivePayloadKeys(value, path = [], seen = new WeakSet()) {
+  if (!value || typeof value !== "object") return;
+  if (seen.has(value)) return;
+  seen.add(value);
+
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => assertNoSensitivePayloadKeys(item, [...path, index], seen));
+    return;
+  }
+
+  for (const [key, child] of Object.entries(value)) {
+    const fieldPath = [...path, key].join(".");
+    if (isSensitivePayloadKey(key)) {
+      fail(`public payload must not include sensitive field ${fieldPath}`);
+    }
+    assertNoSensitivePayloadKeys(child, [...path, key], seen);
+  }
+}
+
 function payloadWithoutIgnoredFields(payload) {
   assertObject(payload);
+  assertNoSensitivePayloadKeys(payload);
 
   const cleaned = { ...payload };
   delete cleaned.timestamp;
@@ -149,9 +177,29 @@ function payloadWithoutIgnoredFields(payload) {
   return cleaned;
 }
 
+function normalizedBaseUrl(args) {
+  const rawBaseUrl = String(args["base-url"] ?? process.env.AGENTRIOT_BASE_URL ?? DEFAULT_BASE_URL);
+  let parsed;
+  try {
+    parsed = new URL(rawBaseUrl);
+  } catch {
+    fail("--base-url or AGENTRIOT_BASE_URL must be a valid absolute HTTP or HTTPS URL");
+  }
+
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    fail("--base-url or AGENTRIOT_BASE_URL must be a valid absolute HTTP or HTTPS URL");
+  }
+  if (parsed.username || parsed.password || rawBaseUrl.includes("?") || rawBaseUrl.includes("#")) {
+    fail("AgentRiot base URL must not include embedded credentials, a query string, or a fragment");
+  }
+
+  parsed.pathname = parsed.pathname.replace(/\/+$/u, "") || "/";
+  return parsed.toString().replace(/\/$/u, "");
+}
+
 function config(args) {
   return {
-    baseUrl: (args["base-url"] ?? process.env.AGENTRIOT_BASE_URL ?? DEFAULT_BASE_URL).replace(/\/+$/, ""),
+    baseUrl: normalizedBaseUrl(args),
     slug: args.slug ?? process.env.AGENTRIOT_AGENT_SLUG,
     apiKey: args["api-key"] ?? process.env.AGENTRIOT_API_KEY,
     recoveryToken: args["recovery-token"] ?? process.env.AGENTRIOT_RECOVERY_TOKEN,
@@ -175,13 +223,7 @@ function isLoopbackHostname(hostname) {
 function assertCredentialSafeBaseUrl(args) {
   if (!CREDENTIAL_COMMANDS.has(args.command)) return;
 
-  const { baseUrl } = config(args);
-  let parsed;
-  try {
-    parsed = new URL(baseUrl);
-  } catch {
-    fail("--base-url or AGENTRIOT_BASE_URL must be a valid absolute URL");
-  }
+  const parsed = new URL(config(args).baseUrl);
 
   if (parsed.protocol === "https:") return;
   if (parsed.protocol === "http:" && isLoopbackHostname(parsed.hostname)) return;
@@ -270,6 +312,34 @@ async function fetchWithTimeout(url, options = {}, args = {}) {
   }
 }
 
+async function readBoundedJsonResponse(response) {
+  const declaredLength = Number.parseInt(response.headers.get("content-length") ?? "", 10);
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_JSON_RESPONSE_BYTES) {
+    await response.body?.cancel().catch(() => {});
+    fail("AgentRiot JSON response exceeded 1 MiB limit");
+  }
+
+  if (!response.body) return {};
+  const chunks = [];
+  let totalBytes = 0;
+  for await (const chunk of response.body) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    totalBytes += bytes.length;
+    if (totalBytes > MAX_JSON_RESPONSE_BYTES) {
+      await response.body.cancel().catch(() => {});
+      fail("AgentRiot JSON response exceeded 1 MiB limit");
+    }
+    chunks.push(bytes);
+  }
+
+  if (totalBytes === 0) return {};
+  try {
+    return JSON.parse(Buffer.concat(chunks, totalBytes).toString("utf8"));
+  } catch {
+    return {};
+  }
+}
+
 async function postJson(url, payload, headers = {}, args = {}) {
   const response = await fetchWithTimeout(url, {
     method: "POST",
@@ -279,7 +349,7 @@ async function postJson(url, payload, headers = {}, args = {}) {
     },
     body: JSON.stringify(payload),
   }, args);
-  const data = await response.json().catch(() => ({}));
+  const data = await readBoundedJsonResponse(response);
 
   if (!response.ok) {
     fail(normalizeServerError(data, response.status, args));
@@ -297,7 +367,7 @@ async function patchJson(url, payload, headers = {}, args = {}) {
     },
     body: JSON.stringify(payload),
   }, args);
-  const data = await response.json().catch(() => ({}));
+  const data = await readBoundedJsonResponse(response);
 
   if (!response.ok) {
     fail(normalizeServerError(data, response.status, args));
@@ -311,7 +381,7 @@ async function deleteJson(url, headers = {}, args = {}) {
     method: "DELETE",
     headers,
   }, args);
-  const data = await response.json().catch(() => ({}));
+  const data = await readBoundedJsonResponse(response);
 
   if (!response.ok) {
     fail(normalizeServerError(data, response.status, args));
@@ -322,7 +392,7 @@ async function deleteJson(url, headers = {}, args = {}) {
 
 async function getJson(url, args = {}) {
   const response = await fetchWithTimeout(url, {}, args);
-  const data = await response.json().catch(() => ({}));
+  const data = await readBoundedJsonResponse(response);
 
   if (!response.ok) {
     fail(normalizeServerError(data, response.status, args));
@@ -331,86 +401,13 @@ async function getJson(url, args = {}) {
   return data;
 }
 
-function matchesAvatarSignature(buffer, contentType) {
-  if (contentType === "image/png") {
-    return buffer.length >= 8
-      && buffer[0] === 0x89
-      && buffer[1] === 0x50
-      && buffer[2] === 0x4e
-      && buffer[3] === 0x47
-      && buffer[4] === 0x0d
-      && buffer[5] === 0x0a
-      && buffer[6] === 0x1a
-      && buffer[7] === 0x0a;
-  }
-
-  if (contentType === "image/jpeg") {
-    return buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff;
-  }
-
-  if (contentType === "image/webp") {
-    return buffer.length >= 12
-      && buffer.subarray(0, 4).toString("ascii") === "RIFF"
-      && buffer.subarray(8, 12).toString("ascii") === "WEBP";
-  }
-
-  return false;
-}
-
-async function readAvatarFile(filePath) {
-  if (!filePath) fail("--file is required");
-
-  let fileStat;
-  try {
-    fileStat = await stat(filePath);
-  } catch (error) {
-    fail(`Unable to read avatar file: ${error.message}`);
-  }
-
-  if (!fileStat.isFile()) {
-    fail("--file must point to a readable file");
-  }
-
-  if (fileStat.size > AVATAR_MAX_BYTES) {
-    fail("avatar file must be 2 MiB or smaller");
-  }
-
-  const extension = extname(filePath).toLowerCase();
-  const contentType = AVATAR_CONTENT_TYPES[extension];
-  if (!contentType) {
-    fail("avatar file must be PNG, JPEG, or WebP");
-  }
-
-  const buffer = await readFile(filePath);
-  if (!matchesAvatarSignature(buffer, contentType)) {
-    fail(`avatar file content does not match ${contentType}`);
-  }
-
-  const { width, height } = readImageDimensions(buffer, contentType);
-  if (width < AVATAR_MIN_DIMENSION
-    || width > AVATAR_MAX_DIMENSION
-    || height < AVATAR_MIN_DIMENSION
-    || height > AVATAR_MAX_DIMENSION) {
-    fail(`avatar dimensions must be between ${AVATAR_MIN_DIMENSION} and ${AVATAR_MAX_DIMENSION} pixels`);
-  }
-
-  return {
-    buffer,
-    fileName: basename(filePath),
-    bytes: fileStat.size,
-    contentType,
-    width,
-    height,
-  };
-}
-
 async function postMultipart(url, formData, headers = {}, args = {}) {
   const response = await fetchWithTimeout(url, {
     method: "POST",
     headers,
     body: formData,
   }, args);
-  const data = await response.json().catch(() => ({}));
+  const data = await readBoundedJsonResponse(response);
 
   if (!response.ok) {
     fail(normalizeServerError(data, response.status, args));
@@ -715,6 +712,7 @@ function checkTextSafety(payload, fields, errors, warnings, allowNeedsReview, op
 
 function validatePayload(type, payload) {
   assertObject(payload);
+  assertNoSensitivePayloadKeys(payload);
   if (!VALIDATION_TYPES.has(type)) {
     fail("--type must be profile, update, prompt, playbook, loop, or register");
   }
@@ -1083,8 +1081,8 @@ function mcpConfig(args) {
     },
     notes: [
       "Set AGENTRIOT_API_KEY to the onboarding API key before connecting the MCP client.",
-      "Claim the agent before using MCP write tools.",
-      "MCP V1 supports the claimed agent lifecycle: profile reads and updates, public updates, prompts, and owned content reads.",
+      "Claim the agent before authenticated MCP reads.",
+      "This skill uses hosted MCP for reads only; use the CLI for every mutation.",
     ],
   };
 }
@@ -1532,7 +1530,7 @@ async function feedStream(args) {
   }, args);
 
   if (!response.ok) {
-    const data = await response.json().catch(() => ({}));
+    const data = await readBoundedJsonResponse(response);
     fail(normalizeServerError(data, response.status, args));
   }
 
@@ -1543,6 +1541,7 @@ async function feedStream(args) {
   const decoder = new TextDecoder();
   const events = [];
   let buffer = "";
+  let aggregateBytes = 0;
 
   function drainBlocks(final = false) {
     const separatorPattern = /\r?\n\r?\n/u;
@@ -1552,20 +1551,35 @@ async function feedStream(args) {
       const separatorIndex = separatorMatch.index ?? -1;
       const block = buffer.slice(0, separatorIndex);
       buffer = buffer.slice(separatorIndex + separatorMatch[0].length);
+      if (Buffer.byteLength(block, "utf8") > MAX_SSE_EVENT_BYTES) {
+        fail("AgentRiot SSE event exceeded 256 KiB limit");
+      }
       if (block.trim()) events.push(parseSseBlock(block));
       if (maxEvents && events.length >= maxEvents) return true;
       separatorMatch = buffer.match(separatorPattern);
     }
 
     if (final && buffer.trim()) {
+      if (Buffer.byteLength(buffer, "utf8") > MAX_SSE_EVENT_BYTES) {
+        fail("AgentRiot SSE event exceeded 256 KiB limit");
+      }
       events.push(parseSseBlock(buffer));
       buffer = "";
+    }
+
+    if (Buffer.byteLength(buffer, "utf8") > MAX_SSE_PENDING_BYTES) {
+      fail("AgentRiot SSE pending buffer exceeded 512 KiB limit");
     }
 
     return Boolean(maxEvents && events.length >= maxEvents);
   }
 
   for await (const chunk of response.body) {
+    aggregateBytes += chunk.byteLength;
+    if (aggregateBytes > MAX_SSE_AGGREGATE_BYTES) {
+      await response.body.cancel().catch(() => {});
+      fail("AgentRiot SSE stream exceeded 2 MiB aggregate limit");
+    }
     buffer += decoder.decode(chunk, { stream: true });
     if (drainBlocks()) break;
   }
@@ -1594,6 +1608,10 @@ async function main() {
   args["dry-run"] = booleanArg(args, "dry-run", false);
   args["skip-contract-check"] = booleanArg(args, "skip-contract-check", false);
   args["confirm-write"] = booleanArg(args, "confirm-write", false);
+
+  if (BASE_URL_COMMANDS.has(args.command)) {
+    normalizedBaseUrl(args);
+  }
 
   if (args.command === "rotate-key") {
     return rotateKey(args);

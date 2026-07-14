@@ -613,16 +613,23 @@ test("state atomic writes fsync the parent directory before success", async () =
   const dir = await mkdtemp(join(tmpdir(), "agentriot-state-"));
   const statePath = join(dir, "state.json");
   let directorySyncs = 0;
+  const order = [];
   const stateIO = createRegistrationStateIO({
+    rename: async (...args) => {
+      order.push("rename");
+      return rename(...args);
+    },
     open: async (filePath, flags, mode) => {
       if (filePath === dir) {
         return {
           async close() {},
           async sync() {
+            order.push("directory-sync");
             directorySyncs += 1;
           },
         };
       }
+      if (filePath === statePath) order.push("final-open");
       return realFileSystem.open(filePath, flags, mode);
     },
   });
@@ -632,6 +639,7 @@ test("state atomic writes fsync the parent directory before success", async () =
   });
 
   assert.equal(directorySyncs, 1);
+  assert.deepEqual(order, ["rename", "directory-sync", "final-open"]);
 });
 
 test("state atomic writes fail closed when directory fsync is unsupported", async () => {
@@ -3057,4 +3065,221 @@ test("public npm commands are clearly framed as post-publish", async () => {
       `${name} contains npm commands without post-publish framing`,
     );
   }
+});
+
+test("base URLs reject credentials, query strings, and fragments without disclosure", async (t) => {
+  const cases = [
+    "https://base_user:base_password@example.com",
+    "https://example.com?apiKey=base_query_secret",
+    "https://example.com/#base_fragment_secret",
+  ];
+
+  for (const command of ["profile", "mcp-config", "check-updates"]) {
+    await t.test(command, async () => {
+      for (const baseUrl of cases) {
+        const result = await runCliFailure([
+          command,
+          ...(command === "profile" ? ["--slug", "portable-agent"] : []),
+          "--base-url",
+          baseUrl,
+        ]);
+        assert.equal(result.code, 1);
+        assert.match(result.stderr, /base URL must not include embedded credentials, a query string, or a fragment/u);
+        for (const secret of ["base_user", "base_password", "base_query_secret", "base_fragment_secret"]) {
+          assert.equal(result.stdout.includes(secret), false);
+          assert.equal(result.stderr.includes(secret), false);
+        }
+      }
+    });
+  }
+});
+
+test("validate recursively rejects normalized sensitive payload keys without echoing values", async (t) => {
+  const keyCases = [
+    "apiKey",
+    "api_key",
+    "x-api-key",
+    "recovery-token",
+    "Authorization",
+    "password",
+    "password_hash",
+    "client_secret",
+    "secretValue",
+    "token_value",
+    "accessToken",
+  ];
+
+  for (const key of keyCases) {
+    await t.test(key, async () => {
+      const secret = `do-not-disclose-${key}`;
+      const inputPath = await writePayload("sensitive.json", {
+        title: "Public launch note",
+        summary: "A public-safe summary.",
+        whatChanged: "Published a bounded workflow.",
+        signalType: "status",
+        metadata: [{ nested: { [key]: secret } }],
+      });
+      const result = await runCliFailure(["validate", "--type", "update", "--input", inputPath]);
+      assert.match(result.stderr, /public payload must not include sensitive field metadata\.0\.nested\./u);
+      assert.equal(result.stdout.includes(secret), false);
+      assert.equal(result.stderr.includes(secret), false);
+    });
+  }
+});
+
+test("update payload cleanup cannot hide sensitive keys in ignored fields", async () => {
+  const secret = "ignored-field-secret-value";
+  const inputPath = await writePayload("ignored-sensitive.json", {
+    title: "Public launch note",
+    summary: "A public-safe summary.",
+    whatChanged: "Published a bounded workflow.",
+    signalType: "status",
+    createdAt: { accessToken: secret },
+  });
+  const result = await runCliFailure(["validate", "--type", "update", "--input", inputPath]);
+  assert.match(result.stderr, /public payload must not include sensitive field createdAt\.accessToken/u);
+  assert.equal(result.stdout.includes(secret), false);
+  assert.equal(result.stderr.includes(secret), false);
+});
+
+test("every payload mutation rejects nested sensitive keys before preflight or mutation", async (t) => {
+  const secret = "payload-write-secret-value";
+  const cases = [
+    ["register", { name: "Portable Agent", tagline: "Shares public work.", description: "A portable public agent.", nested: { apiKey: secret } }, []],
+    ["update-profile", { name: "Portable Agent", nested: { password: secret } }, ["--slug", "portable-agent", "--api-key", "agrt_test_key"]],
+    ["publish-update", { title: "Public launch", summary: "A public summary.", whatChanged: "Added evidence.", signalType: "status", nested: { token: secret } }, ["--slug", "portable-agent", "--api-key", "agrt_test_key"]],
+    ["edit-update", { title: "Public launch", summary: "A public summary.", whatChanged: "Added evidence.", signalType: "status", nested: { authorization: secret } }, ["--slug", "portable-agent", "--api-key", "agrt_test_key", "--update-slug", "launch"]],
+    ["publish-prompt", { title: "Research brief", description: "Summarizes public research.", prompt: "Summarize this.", expectedOutput: "A brief.", nested: { recoveryToken: secret } }, ["--slug", "portable-agent", "--api-key", "agrt_test_key"]],
+    ["edit-prompt", { title: "Research brief", description: "Summarizes public research.", prompt: "Summarize this.", expectedOutput: "A brief.", nested: { clientSecret: secret } }, ["--slug", "portable-agent", "--api-key", "agrt_test_key", "--prompt-slug", "brief"]],
+    ["publish-playbook", { ...validPlaybookPayload(), nested: { access_token: secret } }, ["--slug", "portable-agent", "--api-key", "agrt_test_key"]],
+    ["edit-playbook", { ...validPlaybookPayload(), nested: { PASSWORD: secret } }, ["--slug", "portable-agent", "--api-key", "agrt_test_key", "--playbook-slug", "daily-launch-review"]],
+  ];
+
+  for (const [command, payload, extraArgs] of cases) {
+    await t.test(command, async () => {
+      const inputPath = await writePayload(`${command}-sensitive.json`, payload);
+      let requests = 0;
+      await withServer((_request, response) => {
+        requests += 1;
+        response.writeHead(500, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: "unexpected request" }));
+      }, async (baseUrl) => {
+        const result = await runCliFailure([
+          command,
+          "--input",
+          inputPath,
+          ...extraArgs,
+          "--base-url",
+          baseUrl,
+          "--confirm-write",
+          "true",
+        ]);
+        assert.match(result.stderr, /public payload must not include sensitive field/u);
+        assert.equal(result.stdout.includes(secret), false);
+        assert.equal(result.stderr.includes(secret), false);
+      });
+      assert.equal(requests, 0);
+    });
+  }
+});
+
+test("avatar reader rejects path replacement and post-stat oversize data", async () => {
+  const { createAvatarFileReader } = await import("../bin/lib/avatar.mjs");
+  const fixture = pngFixture(256, 256);
+  const regular = (size, ino) => ({
+    dev: 7,
+    ino,
+    size,
+    isFile: () => true,
+    isSymbolicLink: () => false,
+  });
+
+  let lstatCalls = 0;
+  const racingReader = createAvatarFileReader({
+    lstat: async () => regular(fixture.length, lstatCalls++ === 0 ? 10 : 11),
+    open: async () => ({
+      stat: async () => regular(fixture.length, 10),
+      readFile: async () => fixture,
+      close: async () => {},
+    }),
+  });
+  await assert.rejects(racingReader("avatar.png"), /avatar file path changed during read/u);
+
+  const oversized = Buffer.concat([fixture, Buffer.alloc((2 * 1024 * 1024) + 1)]);
+  const oversizedReader = createAvatarFileReader({
+    lstat: async () => regular(fixture.length, 20),
+    open: async () => ({
+      stat: async () => regular(fixture.length, 20),
+      readFile: async () => oversized,
+      close: async () => {},
+    }),
+  });
+  await assert.rejects(oversizedReader("avatar.png"), /2 MiB or smaller/u);
+});
+
+test("all JSON transports reject oversized responses without disclosing body credentials", async (t) => {
+  const responseSecret = "oversized-json-response-secret";
+  const oversizedBody = JSON.stringify({ apiKey: responseSecret, padding: "x".repeat((1024 * 1024) + 32) });
+  const profilePath = await writePayload("oversized-profile.json", { name: "Portable Agent" });
+  const avatarPath = await writeTempFile("oversized-response-avatar.png", pngFixture(256, 256));
+  const cases = [
+    ["get", ["check-updates"]],
+    ["post", ["claim", "--slug", "portable-agent", "--api-key", "agrt_test_key", "--email", "operator@example.com", "--skip-contract-check", "true", "--confirm-write", "true"]],
+    ["patch", ["update-profile", "--input", profilePath, "--slug", "portable-agent", "--api-key", "agrt_test_key", "--skip-contract-check", "true", "--confirm-write", "true"]],
+    ["delete", ["delete-update", "--update-slug", "launch", "--slug", "portable-agent", "--api-key", "agrt_test_key", "--skip-contract-check", "true", "--confirm-write", "true"]],
+    ["multipart", ["upload-avatar", "--file", avatarPath, "--slug", "portable-agent", "--api-key", "agrt_test_key", "--skip-contract-check", "true", "--confirm-write", "true"]],
+  ];
+
+  for (const [name, commandArgs] of cases) {
+    await t.test(name, async () => {
+      await withServer((_request, response) => {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(oversizedBody);
+      }, async (baseUrl) => {
+        const result = await runCliFailure([...commandArgs, "--base-url", baseUrl]);
+        assert.match(result.stderr, /JSON response exceeded 1 MiB limit/u);
+        assert.equal(result.stdout.includes(responseSecret), false);
+        assert.equal(result.stderr.includes(responseSecret), false);
+      });
+    });
+  }
+});
+
+test("feed stream bounds individual events, pending data, and aggregate data", async (t) => {
+  const secret = "oversized-sse-response-secret";
+  const cases = [
+    ["event", `event: feed-update\ndata: ${secret}${"x".repeat(300 * 1024)}\n\n`, /SSE event exceeded 256 KiB limit/u],
+    ["pending", `data: ${secret}${"x".repeat(600 * 1024)}`, /SSE pending buffer exceeded 512 KiB limit/u],
+    ["aggregate", Array.from({ length: 12 }, (_, index) => `event: feed-update\ndata: ${index}-${"x".repeat(190 * 1024)}\n\n`).join(""), /SSE stream exceeded 2 MiB aggregate limit/u],
+  ];
+
+  for (const [name, body, expected] of cases) {
+    await t.test(name, async () => {
+      await withServer((_request, response) => {
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.end(body);
+      }, async (baseUrl) => {
+        const result = await runCliFailure(["feed-stream", "--base-url", baseUrl]);
+        assert.match(result.stderr, expected);
+        assert.equal(result.stdout.includes(secret), false);
+        assert.equal(result.stderr.includes(secret), false);
+      });
+    });
+  }
+});
+
+test("portable docs reserve mutations for the confirmed CLI and state filesystem limits accurately", async () => {
+  const skill = await readFile(new URL("../SKILL.md", import.meta.url), "utf8");
+  const readme = await readFile(new URL("../README.md", import.meta.url), "utf8");
+  const docs = `${skill}\n${readme}`;
+
+  assert.match(docs, /Use the CLI for every mutation/u);
+  assert.match(docs, /hosted MCP[^\n]*reads only/iu);
+  assert.match(docs, /Node\.js 20\+/u);
+  assert.match(docs, /owner-only permissions/u);
+  assert.match(docs, /no-follow/u);
+  assert.match(docs, /atomic same-directory rename/u);
+  assert.match(docs, /parent-directory fsync/u);
+  assert.match(docs, /Windows[^\n]*durability[^\n]*not guaranteed/iu);
+  assert.doesNotMatch(docs, /hosted MCP[^.]*profile reads and updates/iu);
 });
