@@ -3107,6 +3107,10 @@ test("validate recursively rejects normalized sensitive payload keys without ech
     "secretValue",
     "token_value",
     "accessToken",
+    "clientSecretValue",
+    "oauthAccessTokenHash",
+    "databasePasswordEncrypted",
+    "primaryApiKeyReference",
   ];
 
   for (const key of keyCases) {
@@ -3125,6 +3129,21 @@ test("validate recursively rejects normalized sensitive payload keys without ech
       assert.equal(result.stderr.includes(secret), false);
     });
   }
+});
+
+test("sensitive-name classification preserves obvious non-secret words", async () => {
+  const inputPath = await writePayload("non-sensitive-names.json", {
+    title: "Tokenizer secretary update",
+    summary: "Documents tokenizer and secretary behavior.",
+    whatChanged: "Added public terminology.",
+    signalType: "status",
+    metadata: {
+      secretary: "public role",
+      tokenizer: "public component",
+    },
+  });
+  const result = await runCli(["validate", "--type", "update", "--input", inputPath]);
+  assert.equal(result.validation.valid, true);
 });
 
 test("update payload cleanup cannot hide sensitive keys in ignored fields", async () => {
@@ -3183,6 +3202,51 @@ test("every payload mutation rejects nested sensitive keys before preflight or m
   }
 });
 
+test("playbook and loop parameter names cannot describe sensitive values", async (t) => {
+  const secret = "parameter-secret-value-must-not-echo";
+  const cases = [
+    ["validate-playbook", "validate", validPlaybookPayload({ parameters: [{ name: "clientSecretValue", value: secret }] }), ["--type", "playbook"]],
+    ["validate-loop", "validate", validLoopPayload({ parameters: [{ name: "oauthAccessTokenHash", value: secret }] }), ["--type", "loop"]],
+    ["publish-playbook", "publish-playbook", validPlaybookPayload({ parameters: [{ name: "databasePasswordEncrypted", value: secret }] }), ["--slug", "portable-agent", "--api-key", "agrt_test_key", "--confirm-write", "true"]],
+    ["edit-playbook", "edit-playbook", validPlaybookPayload({ parameters: [{ name: "primaryApiKeyReference", value: secret }] }), ["--slug", "portable-agent", "--api-key", "agrt_test_key", "--playbook-slug", "daily-launch-review", "--confirm-write", "true"]],
+    ["publish-loop", "publish-playbook", validLoopPayload({ parameters: [{ name: "clientSecretValue", value: secret }] }), ["--slug", "portable-agent", "--api-key", "agrt_test_key", "--confirm-write", "true"]],
+    ["edit-loop", "edit-playbook", validLoopPayload({ parameters: [{ name: "oauthAccessTokenHash", value: secret }] }), ["--slug", "portable-agent", "--api-key", "agrt_test_key", "--playbook-slug", "launch-loop", "--confirm-write", "true"]],
+  ];
+
+  for (const [name, command, payload, extraArgs] of cases) {
+    await t.test(name, async () => {
+      const inputPath = await writePayload(`${name}.json`, payload);
+      if (command === "validate") {
+        const result = await runCliFailure([command, "--input", inputPath, ...extraArgs]);
+        assert.match(result.stderr, /parameters\.0\.name must not describe a sensitive value/u);
+        assert.equal(result.stdout.includes(secret), false);
+        assert.equal(result.stderr.includes(secret), false);
+        return;
+      }
+
+      let requests = 0;
+      await withServer((_request, response) => {
+        requests += 1;
+        response.writeHead(500, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: "unexpected request" }));
+      }, async (baseUrl) => {
+        const result = await runCliFailure([
+          command,
+          "--input",
+          inputPath,
+          ...extraArgs,
+          "--base-url",
+          baseUrl,
+        ]);
+        assert.match(result.stderr, /parameters\.0\.name must not describe a sensitive value/u);
+        assert.equal(result.stdout.includes(secret), false);
+        assert.equal(result.stderr.includes(secret), false);
+      });
+      assert.equal(requests, 0);
+    });
+  }
+});
+
 test("avatar reader rejects path replacement and post-stat oversize data", async () => {
   const { createAvatarFileReader } = await import("../bin/lib/avatar.mjs");
   const fixture = pngFixture(256, 256);
@@ -3199,7 +3263,12 @@ test("avatar reader rejects path replacement and post-stat oversize data", async
     lstat: async () => regular(fixture.length, lstatCalls++ === 0 ? 10 : 11),
     open: async () => ({
       stat: async () => regular(fixture.length, 10),
-      readFile: async () => fixture,
+      read: async (target, offset, length, position) => {
+        if (position >= fixture.length) return { bytesRead: 0 };
+        const bytesRead = Math.min(length, fixture.length - position);
+        fixture.copy(target, offset, position, position + bytesRead);
+        return { bytesRead };
+      },
       close: async () => {},
     }),
   });
@@ -3210,11 +3279,47 @@ test("avatar reader rejects path replacement and post-stat oversize data", async
     lstat: async () => regular(fixture.length, 20),
     open: async () => ({
       stat: async () => regular(fixture.length, 20),
-      readFile: async () => oversized,
+      read: async (target, offset, length, position) => {
+        if (position >= oversized.length) return { bytesRead: 0 };
+        const bytesRead = Math.min(length, oversized.length - position);
+        oversized.copy(target, offset, position, position + bytesRead);
+        return { bytesRead };
+      },
       close: async () => {},
     }),
   });
   await assert.rejects(oversizedReader("avatar.png"), /2 MiB or smaller/u);
+});
+
+test("avatar reader caps same-inode growth reads at maximum plus one byte", async () => {
+  const { createAvatarFileReader } = await import("../bin/lib/avatar.mjs");
+  const initialSize = pngFixture(256, 256).length;
+  const fileStat = {
+    dev: 11,
+    ino: 42,
+    size: initialSize,
+    isFile: () => true,
+    isSymbolicLink: () => false,
+  };
+  let totalRequested = 0;
+  let readCalls = 0;
+  const reader = createAvatarFileReader({
+    lstat: async () => fileStat,
+    open: async () => ({
+      stat: async () => fileStat,
+      read: async (target, offset, length) => {
+        readCalls += 1;
+        totalRequested += length;
+        target.fill(0x61, offset, offset + length);
+        return { bytesRead: length };
+      },
+      close: async () => {},
+    }),
+  });
+
+  await assert.rejects(reader("avatar.png"), /2 MiB or smaller/u);
+  assert.equal(totalRequested, (2 * 1024 * 1024) + 1);
+  assert.ok(readCalls >= 1);
 });
 
 test("all JSON transports reject oversized responses without disclosing body credentials", async (t) => {

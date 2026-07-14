@@ -68,6 +68,14 @@ const VALIDATION_TYPES = new Set(["profile", "update", "prompt", "playbook", "lo
 const WRITE_COMMANDS = new Set(["register", "update-profile", "publish-update", "edit-update", "delete-update", "publish-prompt", "edit-prompt", "delete-prompt", "publish-playbook", "edit-playbook", "delete-playbook", "upload-avatar", "claim", "rotate-key"]);
 const CREDENTIAL_COMMANDS = new Set(["register", "update-profile", "publish-update", "edit-update", "delete-update", "publish-prompt", "edit-prompt", "delete-prompt", "publish-playbook", "edit-playbook", "delete-playbook", "upload-avatar", "claim", "rotate-key", "mcp-config"]);
 const BASE_URL_COMMANDS = new Set(["check-updates", "lookup-software", "profile", "mcp-config", "get-profile", "feed-stream", ...WRITE_COMMANDS]);
+const SENSITIVE_NAME_TERMS = new Set([
+  "apikey",
+  "recoverytoken",
+  "authorization",
+  "password",
+  "secret",
+  "token",
+]);
 const AGENT_SIGNAL_TYPES = new Set([
   "major_release",
   "launch",
@@ -140,12 +148,28 @@ function normalizedPayloadKey(key) {
   return String(key).toLowerCase().replace(/[^a-z0-9]/gu, "");
 }
 
+function semanticNameTokens(name) {
+  return String(name)
+    .replace(/([a-z0-9])([A-Z])/gu, "$1 $2")
+    .replace(/([A-Z]+)([A-Z][a-z])/gu, "$1 $2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/gu)
+    .filter(Boolean);
+}
+
 function isSensitivePayloadKey(key) {
   const normalized = normalizedPayloadKey(key);
-  return ["apikey", "recoverytoken", "authorization", "password", "secret", "token"]
-    .some((stem) => normalized === stem
-      || normalized.startsWith(stem)
-      || normalized.endsWith(stem));
+  if (SENSITIVE_NAME_TERMS.has(normalized)) return true;
+
+  const tokens = semanticNameTokens(key);
+  for (let index = 0; index < tokens.length; index += 1) {
+    for (let length = 1; length <= 2 && index + length <= tokens.length; length += 1) {
+      if (SENSITIVE_NAME_TERMS.has(tokens.slice(index, index + length).join(""))) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 function assertNoSensitivePayloadKeys(value, path = [], seen = new WeakSet()) {
@@ -529,6 +553,8 @@ function optionalPlaybookParameters(payload, field, maxItems, errors) {
       addError(errors, `${field}.${index}.name`, "is required");
     } else if (item.name.length > 120) {
       addError(errors, `${field}.${index}.name`, "must be 120 characters or fewer");
+    } else if (isSensitivePayloadKey(item.name)) {
+      addError(errors, `${field}.${index}.name`, "must not describe a sensitive value");
     }
     if (item.description !== undefined) {
       if (typeof item.description !== "string") {

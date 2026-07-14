@@ -42,6 +42,25 @@ function assertSize(size) {
   }
 }
 
+async function readHandleBounded(handle) {
+  const buffer = Buffer.allocUnsafe(AVATAR_MAX_BYTES + 1);
+  let offset = 0;
+
+  while (offset < buffer.length) {
+    const requested = buffer.length - offset;
+    const result = await handle.read(buffer, offset, requested, offset);
+    const bytesRead = result?.bytesRead;
+    if (!Number.isSafeInteger(bytesRead) || bytesRead < 0 || bytesRead > requested) {
+      throw new Error("avatar file returned an invalid read length");
+    }
+    if (bytesRead === 0) break;
+    offset += bytesRead;
+  }
+
+  assertSize(offset);
+  return buffer.subarray(0, offset);
+}
+
 function matchesAvatarSignature(buffer, contentType) {
   if (contentType === "image/png") {
     return buffer.length >= 8
@@ -93,8 +112,7 @@ export function createAvatarFileReader(overrides = {}) {
         throw new Error("avatar file path changed during read");
       }
 
-      const buffer = await handle.readFile();
-      assertSize(buffer.length);
+      const buffer = await readHandleBounded(handle);
 
       const handleAfter = await handle.stat();
       assertRegularFile(handleAfter);
