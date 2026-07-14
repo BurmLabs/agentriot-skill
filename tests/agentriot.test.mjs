@@ -3111,6 +3111,26 @@ test("validate recursively rejects normalized sensitive payload keys without ech
     "oauthAccessTokenHash",
     "databasePasswordEncrypted",
     "primaryApiKeyReference",
+    "oauthToken",
+    "authToken",
+    "bearerToken",
+    "refreshToken",
+    "sessionToken",
+    "apiToken",
+    "idToken",
+    "csrfToken",
+    "tokenHash",
+    "tokenSecret",
+    "tokenKey",
+    "tokenCredential",
+    "tokenEncrypted",
+    "tokenRaw",
+    "tokenHeader",
+    "tokenSignature",
+    "tokenDigest",
+    "mysteryTokenBudget",
+    "ACCESSTOKEN",
+    "mysterytokenbudget",
   ];
 
   for (const key of keyCases) {
@@ -3140,6 +3160,29 @@ test("sensitive-name classification preserves obvious non-secret words", async (
     metadata: {
       secretary: "public role",
       tokenizer: "public component",
+    },
+  });
+  const result = await runCli(["validate", "--type", "update", "--input", inputPath]);
+  assert.equal(result.validation.valid, true);
+});
+
+test("AI token metric field names are accepted only with safe qualifiers", async () => {
+  const inputPath = await writePayload("safe-token-metrics.json", {
+    title: "Token usage update",
+    summary: "Shares public AI usage metrics.",
+    whatChanged: "Added bounded model usage measurements.",
+    signalType: "status",
+    metrics: {
+      tokenBudget: 10000,
+      tokenCount: 4200,
+      tokenLimit: 12000,
+      tokenUsage: 4200,
+      inputTokenCount: 3000,
+      outputTokenCount: 1200,
+      totalTokenUsage: 4200,
+      promptTokenCount: 3000,
+      completionTokenCount: 1200,
+      INPUTTOKENCOUNT: 3000,
     },
   });
   const result = await runCli(["validate", "--type", "update", "--input", inputPath]);
@@ -3205,12 +3248,12 @@ test("every payload mutation rejects nested sensitive keys before preflight or m
 test("playbook and loop parameter names cannot describe sensitive values", async (t) => {
   const secret = "parameter-secret-value-must-not-echo";
   const cases = [
-    ["validate-playbook", "validate", validPlaybookPayload({ parameters: [{ name: "clientSecretValue", value: secret }] }), ["--type", "playbook"]],
-    ["validate-loop", "validate", validLoopPayload({ parameters: [{ name: "oauthAccessTokenHash", value: secret }] }), ["--type", "loop"]],
-    ["publish-playbook", "publish-playbook", validPlaybookPayload({ parameters: [{ name: "databasePasswordEncrypted", value: secret }] }), ["--slug", "portable-agent", "--api-key", "agrt_test_key", "--confirm-write", "true"]],
-    ["edit-playbook", "edit-playbook", validPlaybookPayload({ parameters: [{ name: "primaryApiKeyReference", value: secret }] }), ["--slug", "portable-agent", "--api-key", "agrt_test_key", "--playbook-slug", "daily-launch-review", "--confirm-write", "true"]],
-    ["publish-loop", "publish-playbook", validLoopPayload({ parameters: [{ name: "clientSecretValue", value: secret }] }), ["--slug", "portable-agent", "--api-key", "agrt_test_key", "--confirm-write", "true"]],
-    ["edit-loop", "edit-playbook", validLoopPayload({ parameters: [{ name: "oauthAccessTokenHash", value: secret }] }), ["--slug", "portable-agent", "--api-key", "agrt_test_key", "--playbook-slug", "launch-loop", "--confirm-write", "true"]],
+    ["validate-playbook", "validate", validPlaybookPayload({ parameters: [{ name: "accessToken", value: secret }] }), ["--type", "playbook"]],
+    ["validate-loop", "validate", validLoopPayload({ parameters: [{ name: "oauthToken", value: secret }] }), ["--type", "loop"]],
+    ["publish-playbook", "publish-playbook", validPlaybookPayload({ parameters: [{ name: "authToken", value: secret }] }), ["--slug", "portable-agent", "--api-key", "agrt_test_key", "--confirm-write", "true"]],
+    ["edit-playbook", "edit-playbook", validPlaybookPayload({ parameters: [{ name: "tokenHash", value: secret }] }), ["--slug", "portable-agent", "--api-key", "agrt_test_key", "--playbook-slug", "daily-launch-review", "--confirm-write", "true"]],
+    ["publish-loop", "publish-playbook", validLoopPayload({ parameters: [{ name: "bearerToken", value: secret }] }), ["--slug", "portable-agent", "--api-key", "agrt_test_key", "--confirm-write", "true"]],
+    ["edit-loop", "edit-playbook", validLoopPayload({ parameters: [{ name: "mysteryTokenBudget", value: secret }] }), ["--slug", "portable-agent", "--api-key", "agrt_test_key", "--playbook-slug", "launch-loop", "--confirm-write", "true"]],
   ];
 
   for (const [name, command, payload, extraArgs] of cases) {
@@ -3243,6 +3286,55 @@ test("playbook and loop parameter names cannot describe sensitive values", async
         assert.equal(result.stderr.includes(secret), false);
       });
       assert.equal(requests, 0);
+    });
+  }
+});
+
+test("playbook and loop token metric parameters validate and dry-run safely", async (t) => {
+  const cases = [
+    ["validate-playbook", "validate", validPlaybookPayload({ parameters: [{ name: "tokenBudget", value: 10000 }] }), ["--type", "playbook"]],
+    ["validate-loop", "validate", validLoopPayload({ parameters: [{ name: "inputTokenCount", value: 3000 }] }), ["--type", "loop"]],
+    ["publish-playbook", "publish-playbook", validPlaybookPayload({ parameters: [{ name: "tokenLimit", value: 12000 }] }), ["--slug", "portable-agent", "--api-key", "agrt_test_key", "--dry-run", "true"]],
+    ["edit-playbook", "edit-playbook", validPlaybookPayload({ parameters: [{ name: "outputTokenCount", value: 1200 }] }), ["--slug", "portable-agent", "--api-key", "agrt_test_key", "--playbook-slug", "daily-launch-review", "--dry-run", "true"]],
+    ["publish-loop", "publish-playbook", validLoopPayload({ parameters: [{ name: "totalTokenUsage", value: 4200 }] }), ["--slug", "portable-agent", "--api-key", "agrt_test_key", "--dry-run", "true"]],
+    ["edit-loop", "edit-playbook", validLoopPayload({ parameters: [{ name: "completionTokenCount", value: 1200 }] }), ["--slug", "portable-agent", "--api-key", "agrt_test_key", "--playbook-slug", "launch-loop", "--dry-run", "true"]],
+  ];
+
+  for (const [name, command, payload, extraArgs] of cases) {
+    await t.test(name, async () => {
+      const inputPath = await writePayload(`${name}-safe-token-metric.json`, payload);
+      if (command === "validate") {
+        const result = await runCli([command, "--input", inputPath, ...extraArgs]);
+        assert.equal(result.validation.valid, true);
+        return;
+      }
+
+      let preflights = 0;
+      let mutations = 0;
+      await withServer((request, response) => {
+        if (request.url === "/api/agent-protocol") {
+          preflights += 1;
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end(JSON.stringify(protocolResponse()));
+          return;
+        }
+        mutations += 1;
+        response.writeHead(500, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: "unexpected mutation" }));
+      }, async (baseUrl) => {
+        const result = await runCli([
+          command,
+          "--input",
+          inputPath,
+          ...extraArgs,
+          "--base-url",
+          baseUrl,
+        ]);
+        assert.equal(result.dryRun, true);
+        assert.equal(result.validation.valid, true);
+      });
+      assert.equal(preflights, 1);
+      assert.equal(mutations, 0);
     });
   }
 });

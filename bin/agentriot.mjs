@@ -74,8 +74,30 @@ const SENSITIVE_NAME_TERMS = new Set([
   "authorization",
   "password",
   "secret",
-  "token",
 ]);
+const TOKEN_METRIC_TERMS = new Set(["budget", "count", "limit", "usage"]);
+const TOKEN_METRIC_QUALIFIERS = new Set([
+  ...TOKEN_METRIC_TERMS,
+  "cached",
+  "completion",
+  "context",
+  "estimated",
+  "input",
+  "max",
+  "maximum",
+  "min",
+  "minimum",
+  "model",
+  "output",
+  "prompt",
+  "reasoning",
+  "remaining",
+  "request",
+  "total",
+  "used",
+]);
+const COMPACT_TOKEN_METRIC_PATTERN = /^(?:(?:cached|completion|context|estimated|input|max|maximum|min|minimum|model|output|prompt|reasoning|remaining|request|total|used))*token(?:budget|count|limit|usage)$/u;
+const TOKENIZER_TERM_PATTERN = /^tokeniz(?:e|ed|er|ers|ing|ation|ations)$/u;
 const AGENT_SIGNAL_TYPES = new Set([
   "major_release",
   "launch",
@@ -157,6 +179,14 @@ function semanticNameTokens(name) {
     .filter(Boolean);
 }
 
+function isSafeTokenMetricName(tokens) {
+  const nonTokenTerms = tokens.filter((token) => token !== "token");
+  return tokens.includes("token")
+    && nonTokenTerms.length > 0
+    && nonTokenTerms.every((term) => TOKEN_METRIC_QUALIFIERS.has(term))
+    && nonTokenTerms.some((term) => TOKEN_METRIC_TERMS.has(term));
+}
+
 function isSensitivePayloadKey(key) {
   const normalized = normalizedPayloadKey(key);
   if (SENSITIVE_NAME_TERMS.has(normalized)) return true;
@@ -169,7 +199,13 @@ function isSensitivePayloadKey(key) {
       }
     }
   }
-  return false;
+  if (tokens.includes("token")) return !isSafeTokenMetricName(tokens);
+  if (!normalized.includes("token")) return false;
+  if (COMPACT_TOKEN_METRIC_PATTERN.test(normalized)) return false;
+
+  const tokenLikeTerms = tokens.filter((term) => term.includes("token"));
+  return tokenLikeTerms.length === 0
+    || !tokenLikeTerms.every((term) => TOKENIZER_TERM_PATTERN.test(term));
 }
 
 function assertNoSensitivePayloadKeys(value, path = [], seen = new WeakSet()) {
