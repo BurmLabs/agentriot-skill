@@ -228,12 +228,81 @@ test("CLI defaults to AgentRiot production for static commands", async () => {
   assert.equal(result.publicUrl, "https://agentriot.com/agents/my-research-agent");
 });
 
-test("write commands do not contain a production confirmation guard", async () => {
-  const source = await readFile(scriptPath, "utf8");
+test("dry-run rejects invalid boolean values before network access", async () => {
+  let requests = 0;
 
-  assert.equal(source.includes("confirm-production"), false);
-  assert.equal(source.includes("assertProductionWriteAllowed"), false);
-  assert.equal(source.includes("isProductionBaseUrl"), false);
+  await withServer((_request, response) => {
+    requests += 1;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify(protocolResponse()));
+  }, async (baseUrl) => {
+    const result = await runCliFailure([
+      "claim",
+      "--slug",
+      "lifecycle-agent",
+      "--api-key",
+      "agrt_secret_key",
+      "--base-url",
+      baseUrl,
+      "--dry-run",
+      "ture",
+    ]);
+
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /--dry-run must be true or false/u);
+    assert.equal(requests, 0);
+  });
+});
+
+test("unknown flags fail closed", async () => {
+  const result = await runCliFailure([
+    "profile",
+    "--slug",
+    "lifecycle-agent",
+    "--unknown",
+    "value",
+  ]);
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /Unknown flag for profile: --unknown/u);
+});
+
+test("unknown no-input commands are rejected as unknown", async () => {
+  const result = await runCliFailure(["unknown-command"]);
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /Unknown command: unknown-command/u);
+  assert.doesNotMatch(result.stderr, /--input is required/u);
+});
+
+test("live claim requires explicit write confirmation before mutation", async () => {
+  let mutationRequests = 0;
+
+  await withServer((request, response) => {
+    if (request.url === "/api/agent-protocol") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(protocolResponse()));
+      return;
+    }
+
+    mutationRequests += 1;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ claimed: true, agentId: "agt_1" }));
+  }, async (baseUrl) => {
+    const result = await runCliFailure([
+      "claim",
+      "--slug",
+      "lifecycle-agent",
+      "--api-key",
+      "agrt_secret_key",
+      "--base-url",
+      baseUrl,
+    ]);
+
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /--confirm-write true is required for live writes/u);
+    assert.equal(mutationRequests, 0);
+  });
 });
 
 test("lookup-software calls the AgentRiot software API", async () => {
@@ -284,7 +353,7 @@ test("register generates and persists a stable installation identity with return
       apiKey: "agrt_secret",
     }));
   }, async (baseUrl) => {
-    const result = await runCli(["register", "--input", inputPath, "--base-url", baseUrl]);
+    const result = await runCli(["register", "--input", inputPath, "--base-url", baseUrl, "--confirm-write", "true"]);
 
     assert.equal(result.ok, true);
     assert.equal(result.command, "register");
@@ -328,7 +397,7 @@ test("register writes credential state with owner-only permissions", async () =>
         apiKey: "agrt_secret",
       }));
     }, async (baseUrl) => {
-      await runCli(["register", "--input", inputPath, "--base-url", baseUrl]);
+      await runCli(["register", "--input", inputPath, "--base-url", baseUrl, "--confirm-write", "true"]);
 
       const mode = (await stat(statePath)).mode & 0o777;
       assert.equal(mode, 0o600);
@@ -370,7 +439,7 @@ test("register reuses the persisted installation identity on repeat registration
       apiKey: null,
     }));
   }, async (baseUrl) => {
-    const result = await runCli(["register", "--input", inputPath, "--base-url", baseUrl]);
+    const result = await runCli(["register", "--input", inputPath, "--base-url", baseUrl, "--confirm-write", "true"]);
 
     assert.equal(result.ok, true);
     assert.equal(result.command, "register");
@@ -717,6 +786,8 @@ test("write command protocol preflight rejects incompatible contracts before mut
       "agrt_secret_key",
       "--base-url",
       baseUrl,
+      "--confirm-write",
+      "true",
     ]);
 
     assert.equal(result.code, 1);
@@ -798,6 +869,8 @@ test("upload-avatar posts multipart form data with API key header", async () => 
       "agrt_secret_key",
       "--base-url",
       baseUrl,
+      "--confirm-write",
+      "true",
     ]);
     const serialized = JSON.stringify(result);
 
@@ -989,6 +1062,8 @@ test("server validation errors include field-specific details", async () => {
       "agrt_secret_key",
       "--base-url",
       baseUrl,
+      "--confirm-write",
+      "true",
     ]);
 
     assert.equal(result.code, 1);
@@ -1045,6 +1120,8 @@ test("edit-update patches an existing timeline update", async () => {
       "agrt_test_key",
       "--base-url",
       baseUrl,
+      "--confirm-write",
+      "true",
     ]);
 
     assert.equal(result.command, "edit-update");
@@ -1093,6 +1170,8 @@ test("edit-prompt patches an existing shared prompt", async () => {
       "agrt_test_key",
       "--base-url",
       baseUrl,
+      "--confirm-write",
+      "true",
     ]);
 
     assert.equal(result.command, "edit-prompt");
@@ -1138,6 +1217,8 @@ test("publish-playbook posts a public playbook with API key header", async () =>
       "agrt_secret_key",
       "--base-url",
       baseUrl,
+      "--confirm-write",
+      "true",
     ]);
     const serialized = JSON.stringify(result);
 
@@ -1190,6 +1271,8 @@ test("publish-playbook posts an Agent Loop and reports canonical loop paths", as
       "agrt_secret_key",
       "--base-url",
       baseUrl,
+      "--confirm-write",
+      "true",
     ]);
     const serialized = JSON.stringify(result);
 
@@ -1244,6 +1327,8 @@ test("edit-playbook patches an existing public playbook", async () => {
       "agrt_secret_key",
       "--base-url",
       baseUrl,
+      "--confirm-write",
+      "true",
     ]);
 
     assert.equal(result.ok, true);
@@ -1295,6 +1380,8 @@ test("edit-playbook patches an Agent Loop and keeps canonical loop path", async 
       "agrt_secret_key",
       "--base-url",
       baseUrl,
+      "--confirm-write",
+      "true",
     ]);
 
     assert.equal(result.ok, true);

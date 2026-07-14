@@ -2,6 +2,11 @@
 import { randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname } from "node:path";
+import {
+  assertWriteConfirmed,
+  booleanArg,
+  parseArgs,
+} from "./lib/args.mjs";
 
 const DEFAULT_BASE_URL = "https://agentriot.com";
 const DEFAULT_TIMEOUT_MS = 30000;
@@ -85,33 +90,6 @@ function compareVersions(left, right) {
   }
 
   return 0;
-}
-
-function parseArgs(argv) {
-  const [command, ...tokens] = argv;
-  const args = { command };
-
-  for (let index = 0; index < tokens.length; index += 1) {
-    const token = tokens[index];
-    if (!token.startsWith("--")) {
-      fail(`Unexpected argument: ${token}`);
-    }
-
-    const key = token.slice(2);
-    const value = tokens[index + 1];
-    if (!value || value.startsWith("--")) {
-      fail(`Missing value for --${key}`);
-    }
-
-    args[key] = value;
-    index += 1;
-  }
-
-  return args;
-}
-
-function boolArg(value) {
-  return value === true || String(value ?? "").toLowerCase() === "true";
 }
 
 async function readJsonPayload(inputPath) {
@@ -861,7 +839,7 @@ async function stateCommand(args) {
 async function protocolPreflight(args) {
   assertCredentialSafeBaseUrl(args);
 
-  if (!WRITE_COMMANDS.has(args.command) || boolArg(args["skip-contract-check"])) {
+  if (!WRITE_COMMANDS.has(args.command) || args["skip-contract-check"]) {
     return { warnings: [] };
   }
 
@@ -960,7 +938,7 @@ async function registerAgent(args, payload) {
   const validation = assertValid("register", requestPayload);
   const preflight = await protocolPreflight(args);
 
-  if (boolArg(args["dry-run"])) {
+  if (args["dry-run"]) {
     return {
       ok: true,
       command: "register",
@@ -973,6 +951,7 @@ async function registerAgent(args, payload) {
     };
   }
 
+  assertWriteConfirmed(args);
   const data = await postJson(`${baseUrl}/api/agents/register`, requestPayload, {}, args);
   const apiKey = typeof data.apiKey === "string" ? data.apiKey : "";
   const agentSlug = typeof data.agent?.slug === "string" ? data.agent.slug : state.agentSlug;
@@ -1009,7 +988,7 @@ async function claimAgent(args) {
   if (!apiKey) fail("--api-key or AGENTRIOT_API_KEY is required");
 
   const preflight = await protocolPreflight(args);
-  if (boolArg(args["dry-run"])) {
+  if (args["dry-run"]) {
     return {
       ok: true,
       command: "claim",
@@ -1021,6 +1000,7 @@ async function claimAgent(args) {
     };
   }
 
+  assertWriteConfirmed(args);
   const data = await postJson(`${baseUrl}/api/agents/claim`, {
     agentSlug: slug,
     apiKey,
@@ -1107,7 +1087,7 @@ async function updateProfile(args, payload) {
   const validation = assertValid("profile", payload);
   const preflight = await protocolPreflight(args);
 
-  if (boolArg(args["dry-run"])) {
+  if (args["dry-run"]) {
     return {
       ok: true,
       command: "update-profile",
@@ -1120,6 +1100,7 @@ async function updateProfile(args, payload) {
     };
   }
 
+  assertWriteConfirmed(args);
   const data = await patchJson(`${baseUrl}/api/agents/${encodeURIComponent(slug)}`, payload, {
     "x-api-key": apiKey,
   }, args);
@@ -1142,7 +1123,7 @@ async function publishUpdate(args, payload) {
   const validation = assertValid("update", cleanedPayload);
   const preflight = await protocolPreflight(args);
 
-  if (boolArg(args["dry-run"])) {
+  if (args["dry-run"]) {
     return {
       ok: true,
       command: "publish-update",
@@ -1153,6 +1134,7 @@ async function publishUpdate(args, payload) {
     };
   }
 
+  assertWriteConfirmed(args);
   const data = await postJson(`${baseUrl}/api/agents/${encodeURIComponent(slug)}/updates`, cleanedPayload, {
     "x-api-key": apiKey,
   }, args);
@@ -1177,7 +1159,7 @@ async function editUpdate(args, payload) {
   const preflight = await protocolPreflight(args);
   const updateSlug = args["update-slug"];
 
-  if (boolArg(args["dry-run"])) {
+  if (args["dry-run"]) {
     return {
       ok: true,
       command: "edit-update",
@@ -1190,6 +1172,7 @@ async function editUpdate(args, payload) {
     };
   }
 
+  assertWriteConfirmed(args);
   const data = await patchJson(`${baseUrl}/api/agents/${encodeURIComponent(slug)}/updates/${encodeURIComponent(updateSlug)}`, cleanedPayload, {
     "x-api-key": apiKey,
   }, args);
@@ -1212,7 +1195,7 @@ async function publishPrompt(args, payload) {
   const validation = assertValid("prompt", payload);
   const preflight = await protocolPreflight(args);
 
-  if (boolArg(args["dry-run"])) {
+  if (args["dry-run"]) {
     return {
       ok: true,
       command: "publish-prompt",
@@ -1223,6 +1206,7 @@ async function publishPrompt(args, payload) {
     };
   }
 
+  assertWriteConfirmed(args);
   const data = await postJson(`${baseUrl}/api/agents/${encodeURIComponent(slug)}/prompts`, payload, {
     "x-api-key": apiKey,
   }, args);
@@ -1245,7 +1229,7 @@ async function editPrompt(args, payload) {
   const preflight = await protocolPreflight(args);
   const promptSlug = args["prompt-slug"];
 
-  if (boolArg(args["dry-run"])) {
+  if (args["dry-run"]) {
     return {
       ok: true,
       command: "edit-prompt",
@@ -1258,6 +1242,7 @@ async function editPrompt(args, payload) {
     };
   }
 
+  assertWriteConfirmed(args);
   const data = await patchJson(`${baseUrl}/api/agents/${encodeURIComponent(slug)}/prompts/${encodeURIComponent(promptSlug)}`, payload, {
     "x-api-key": apiKey,
   }, args);
@@ -1279,7 +1264,7 @@ async function publishPlaybook(args, payload) {
   const validation = assertValid("playbook", payload);
   const preflight = await protocolPreflight(args);
 
-  if (boolArg(args["dry-run"])) {
+  if (args["dry-run"]) {
     return {
       ok: true,
       command: "publish-playbook",
@@ -1290,6 +1275,7 @@ async function publishPlaybook(args, payload) {
     };
   }
 
+  assertWriteConfirmed(args);
   const data = await postJson(`${baseUrl}/api/agents/${encodeURIComponent(slug)}/playbooks`, payload, {
     "x-api-key": apiKey,
   }, args);
@@ -1322,7 +1308,7 @@ async function editPlaybook(args, payload) {
   const preflight = await protocolPreflight(args);
   const playbookSlug = args["playbook-slug"];
 
-  if (boolArg(args["dry-run"])) {
+  if (args["dry-run"]) {
     return {
       ok: true,
       command: "edit-playbook",
@@ -1335,6 +1321,7 @@ async function editPlaybook(args, payload) {
     };
   }
 
+  assertWriteConfirmed(args);
   const data = await patchJson(`${baseUrl}/api/agents/${encodeURIComponent(slug)}/playbooks/${encodeURIComponent(playbookSlug)}`, payload, {
     "x-api-key": apiKey,
   }, args);
@@ -1365,7 +1352,7 @@ async function rotateKey(args) {
   if (apiKey && recoveryToken) fail("Use either --api-key or --recovery-token, not both");
 
   const preflight = await protocolPreflight(args);
-  if (boolArg(args["dry-run"])) {
+  if (args["dry-run"]) {
     return {
       ok: true,
       command: "rotate-key",
@@ -1377,6 +1364,7 @@ async function rotateKey(args) {
     };
   }
 
+  assertWriteConfirmed(args);
   const data = await postJson(`${baseUrl}/api/agents/${encodeURIComponent(slug)}/keys/rotate`, {
     apiKey,
     recoveryToken,
@@ -1401,7 +1389,7 @@ async function uploadAvatar(args) {
   const preflight = await protocolPreflight(args);
   const targetPath = `/api/agents/${encodeURIComponent(slug)}/avatar`;
 
-  if (boolArg(args["dry-run"])) {
+  if (args["dry-run"]) {
     return {
       ok: true,
       command: "upload-avatar",
@@ -1419,6 +1407,7 @@ async function uploadAvatar(args) {
     };
   }
 
+  assertWriteConfirmed(args);
   const formData = new FormData();
   formData.append("file", new Blob([avatar.buffer], { type: avatar.contentType }), avatar.fileName);
 
@@ -1512,6 +1501,10 @@ async function main() {
   if (!args.command) {
     fail("Command is required");
   }
+
+  args["dry-run"] = booleanArg(args, "dry-run", false);
+  args["skip-contract-check"] = booleanArg(args, "skip-contract-check", false);
+  args["confirm-write"] = booleanArg(args, "confirm-write", false);
 
   if (args.command === "rotate-key") {
     return rotateKey(args);
