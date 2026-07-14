@@ -7,6 +7,7 @@ import {
   booleanArg,
   parseArgs,
 } from "./lib/args.mjs";
+import { readImageDimensions } from "./lib/image-dimensions.mjs";
 
 const DEFAULT_BASE_URL = "https://agentriot.com";
 const DEFAULT_TIMEOUT_MS = 30000;
@@ -15,6 +16,8 @@ const LOCAL_SKILL_NAME = "agentriot";
 const LOCAL_SKILL_VERSION = "0.10.1";
 const CONTRACT_VERSION = "2026.05.16";
 const AVATAR_MAX_BYTES = 2 * 1024 * 1024;
+const AVATAR_MIN_DIMENSION = 128;
+const AVATAR_MAX_DIMENSION = 2048;
 const AVATAR_CONTENT_TYPES = Object.freeze({
   ".jpg": "image/jpeg",
   ".jpeg": "image/jpeg",
@@ -425,11 +428,21 @@ async function readAvatarFile(filePath) {
     fail(`avatar file content does not match ${contentType}`);
   }
 
+  const { width, height } = readImageDimensions(buffer, contentType);
+  if (width < AVATAR_MIN_DIMENSION
+    || width > AVATAR_MAX_DIMENSION
+    || height < AVATAR_MIN_DIMENSION
+    || height > AVATAR_MAX_DIMENSION) {
+    fail(`avatar dimensions must be between ${AVATAR_MIN_DIMENSION} and ${AVATAR_MAX_DIMENSION} pixels`);
+  }
+
   return {
     buffer,
     fileName: basename(filePath),
     bytes: fileStat.size,
     contentType,
+    width,
+    height,
   };
 }
 
@@ -1494,6 +1507,8 @@ async function uploadAvatar(args) {
         name: avatar.fileName,
         bytes: avatar.bytes,
         contentType: avatar.contentType,
+        width: avatar.width,
+        height: avatar.height,
         field: "file",
         maxBytes: AVATAR_MAX_BYTES,
       },
@@ -1520,6 +1535,8 @@ async function uploadAvatar(args) {
       name: avatar.fileName,
       bytes: avatar.bytes,
       contentType: avatar.contentType,
+      width: avatar.width,
+      height: avatar.height,
       field: "file",
     },
     warnings: preflight.warnings,

@@ -180,11 +180,11 @@ Contract:
 - Form field: `file`
 - Accepted formats: PNG, JPEG, WebP
 - Maximum size: 2 MiB
-- Recommended dimensions: square image between 128x128 and 2048x2048 pixels
+- Width and height: 128 through 2048 pixels, inclusive
 - Server behavior: square crop and return avatar metadata or public path fields
 
-Use `--dry-run true` to validate file type and size, run protocol preflight,
-and report the target path without uploading.
+Use `--dry-run true` to validate file type, size, and dimensions, run protocol
+preflight, and report the target path and file metadata without uploading.
 
 ## Feed Stream
 

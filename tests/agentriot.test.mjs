@@ -64,11 +64,68 @@ async function runCliFailure(args, options = {}) {
   assert.fail("CLI command unexpectedly succeeded");
 }
 
-function tinyPng() {
-  return Buffer.from(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
-    "base64",
-  );
+function pngFixture(width, height) {
+  const buffer = Buffer.alloc(33);
+  Buffer.from("89504e470d0a1a0a", "hex").copy(buffer);
+  buffer.writeUInt32BE(13, 8);
+  buffer.write("IHDR", 12, "ascii");
+  buffer.writeUInt32BE(width, 16);
+  buffer.writeUInt32BE(height, 20);
+  return buffer;
+}
+
+function jpegFixture(width, height) {
+  const startOfFrame = Buffer.from([
+    0xff, 0xc0, 0x00, 0x0b, 0x08,
+    0x00, 0x00,
+    0x00, 0x00,
+    0x01,
+    0x01, 0x11, 0x00,
+  ]);
+  startOfFrame.writeUInt16BE(height, 5);
+  startOfFrame.writeUInt16BE(width, 7);
+  return Buffer.concat([
+    Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x04, 0x00, 0x00]),
+    startOfFrame,
+  ]);
+}
+
+function webpRiff(chunkType, chunkData) {
+  const buffer = Buffer.alloc(20 + chunkData.length + (chunkData.length % 2));
+  buffer.write("RIFF", 0, "ascii");
+  buffer.writeUInt32LE(buffer.length - 8, 4);
+  buffer.write("WEBP", 8, "ascii");
+  buffer.write(chunkType, 12, "ascii");
+  buffer.writeUInt32LE(chunkData.length, 16);
+  chunkData.copy(buffer, 20);
+  return buffer;
+}
+
+function webpVp8xFixture(width, height) {
+  const chunkData = Buffer.alloc(10);
+  chunkData.writeUIntLE(width - 1, 4, 3);
+  chunkData.writeUIntLE(height - 1, 7, 3);
+  return webpRiff("VP8X", chunkData);
+}
+
+function webpVp8Fixture(width, height) {
+  const chunkData = Buffer.from([
+    0x00, 0x00, 0x00,
+    0x9d, 0x01, 0x2a,
+    0x00, 0x00,
+    0x00, 0x00,
+  ]);
+  chunkData.writeUInt16LE(width, 6);
+  chunkData.writeUInt16LE(height, 8);
+  return webpRiff("VP8 ", chunkData);
+}
+
+function webpVp8lFixture(width, height) {
+  const chunkData = Buffer.alloc(5);
+  chunkData[0] = 0x2f;
+  const dimensions = BigInt(width - 1) | (BigInt(height - 1) << 14n);
+  chunkData.writeUInt32LE(Number(dimensions), 1);
+  return webpRiff("VP8L", chunkData);
 }
 
 function validPlaybookPayload(overrides = {}) {
@@ -927,7 +984,7 @@ test("write command protocol preflight rejects incompatible contracts before mut
 });
 
 test("upload-avatar dry-run validates file metadata and preflights without upload", async () => {
-  const avatarPath = await writeTempFile("avatar.png", tinyPng());
+  const avatarPath = await writeTempFile("avatar.png", pngFixture(128, 128));
   let requests = 0;
 
   await withServer((request, response) => {
@@ -957,6 +1014,8 @@ test("upload-avatar dry-run validates file metadata and preflights without uploa
     assert.equal(result.targetPath, "/api/agents/lifecycle-agent/avatar");
     assert.equal(result.file.field, "file");
     assert.equal(result.file.contentType, "image/png");
+    assert.equal(result.file.width, 128);
+    assert.equal(result.file.height, 128);
     assert.equal(result.file.maxBytes, 2 * 1024 * 1024);
     assert.equal(requests, 1);
     assert.equal(serialized.includes("agrt_secret_key"), false);
@@ -964,7 +1023,7 @@ test("upload-avatar dry-run validates file metadata and preflights without uploa
 });
 
 test("upload-avatar posts multipart form data with API key header", async () => {
-  const avatarPath = await writeTempFile("avatar.png", tinyPng());
+  const avatarPath = await writeTempFile("avatar.png", pngFixture(256, 256));
   const seen = {};
 
   await withServer(async (request, response) => {
@@ -1008,6 +1067,8 @@ test("upload-avatar posts multipart form data with API key header", async () => 
     assert.equal(result.command, "upload-avatar");
     assert.equal(result.publicPath, "/uploads/agents/lifecycle-agent/avatar.png");
     assert.equal(result.avatarUrl, `${baseUrl}/uploads/agents/lifecycle-agent/avatar.png`);
+    assert.equal(result.file.width, 256);
+    assert.equal(result.file.height, 256);
     assert.match(seen.body, /name="file"; filename="avatar\.png"/u);
     assert.match(seen.body, /Content-Type: image\/png/u);
     assert.equal(serialized.includes("agrt_secret_key"), false);
@@ -1015,7 +1076,7 @@ test("upload-avatar posts multipart form data with API key header", async () => 
 });
 
 test("upload-avatar rejects invalid inputs before mutation", async () => {
-  const validAvatarPath = await writeTempFile("avatar.png", tinyPng());
+  const validAvatarPath = await writeTempFile("avatar.png", pngFixture(256, 256));
   const avatarPath = await writeTempFile("avatar.gif", Buffer.from("GIF89a", "ascii"));
 
   const missingSlug = await runCliFailure([
@@ -1087,6 +1148,83 @@ test("upload-avatar rejects invalid inputs before mutation", async () => {
   ]);
   assert.equal(invalidContent.code, 1);
   assert.match(invalidContent.stderr, /does not match image\/png/u);
+});
+
+test("upload-avatar accepts PNG, JPEG, and WebP dimensions at inclusive boundaries", async () => {
+  const fixtures = [
+    ["avatar.png", pngFixture(128, 128), "image/png", 128, 128],
+    ["avatar.jpg", jpegFixture(2048, 2048), "image/jpeg", 2048, 2048],
+    ["avatar-vp8.webp", webpVp8Fixture(512, 768), "image/webp", 512, 768],
+    ["avatar-vp8l.webp", webpVp8lFixture(640, 480), "image/webp", 640, 480],
+    ["avatar-vp8x.webp", webpVp8xFixture(1024, 1536), "image/webp", 1024, 1536],
+  ];
+
+  await withServer((request, response) => {
+    assert.equal(request.url, "/api/agent-protocol");
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify(protocolResponse()));
+  }, async (baseUrl) => {
+    for (const [name, contents, contentType, width, height] of fixtures) {
+      const avatarPath = await writeTempFile(name, contents);
+      const result = await runCli([
+        "upload-avatar",
+        "--file",
+        avatarPath,
+        "--slug",
+        "lifecycle-agent",
+        "--api-key",
+        "agrt_secret_key",
+        "--base-url",
+        baseUrl,
+        "--dry-run",
+        "true",
+      ]);
+
+      assert.equal(result.file.contentType, contentType);
+      assert.equal(result.file.width, width);
+      assert.equal(result.file.height, height);
+    }
+  });
+});
+
+test("upload-avatar rejects malformed and out-of-range dimensions before preflight", async () => {
+  const fixtures = [
+    ["too-small.png", pngFixture(1, 1), /between 128 and 2048 pixels/u],
+    ["too-wide.jpg", jpegFixture(4096, 128), /between 128 and 2048 pixels/u],
+    ["truncated.webp", webpVp8xFixture(256, 256).subarray(0, 24), /Malformed WebP image/u],
+    ["signature-only.png", Buffer.from("89504e470d0a1a0a", "hex"), /Malformed PNG image/u],
+    ["signature-only.jpg", Buffer.from("ffd8ff", "hex"), /Malformed JPEG image/u],
+    ["signature-only.webp", Buffer.from("524946460000000057454250", "hex"), /Malformed WebP image/u],
+  ];
+  let requests = 0;
+
+  await withServer((_request, response) => {
+    requests += 1;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify(protocolResponse()));
+  }, async (baseUrl) => {
+    for (const [name, contents, expectedError] of fixtures) {
+      const avatarPath = await writeTempFile(name, contents);
+      const result = await runCliFailure([
+        "upload-avatar",
+        "--file",
+        avatarPath,
+        "--slug",
+        "lifecycle-agent",
+        "--api-key",
+        "agrt_secret_key",
+        "--base-url",
+        baseUrl,
+        "--dry-run",
+        "true",
+      ]);
+
+      assert.equal(result.code, 1);
+      assert.match(result.stderr, expectedError);
+    }
+  });
+
+  assert.equal(requests, 0);
 });
 
 test("feed-stream reads public SSE events and exits after max events", async () => {
