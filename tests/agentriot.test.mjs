@@ -1637,6 +1637,7 @@ test("delete error sanitizes reflected secrets and bounds stderr", async () => {
   const recoveryToken = "recovery_exact_configured_secret";
   const reflectedBearer = "eyJhbGciOiJIUzI1NiJ9.reflected.signature";
   const reflectedApiKey = "agrt_server_reflected_secret";
+  const reflectedLabeledKey = "ZYXWVUTSRQPONMLK";
 
   await withServer((request, response) => {
     if (request.url === "/api/agent-protocol") {
@@ -1651,6 +1652,9 @@ test("delete error sanitizes reflected secrets and bounds stderr", async () => {
       error: `Rejected ${apiKey} and ${recoveryToken}`,
       details: [
         `Fetch https://alice:password@example.com/private with Bearer ${reflectedBearer}`,
+        "Database postgresql://admin:database-password@example.com/private",
+        "Mirror ftp://ftp-user:ftp-password@example.com/private",
+        `API key: ${reflectedLabeledKey}`,
         { field: "apiKey", message: reflectedApiKey },
         { field: "payload", message: "x".repeat(4000) },
       ],
@@ -1681,6 +1685,11 @@ test("delete error sanitizes reflected secrets and bounds stderr", async () => {
     assert.equal(result.stderr.includes("password"), false);
     assert.equal(result.stderr.includes(reflectedBearer), false);
     assert.equal(result.stderr.includes(reflectedApiKey), false);
+    assert.equal(result.stderr.includes(reflectedLabeledKey), false);
+    assert.equal(result.stderr.includes("admin"), false);
+    assert.equal(result.stderr.includes("database-password"), false);
+    assert.equal(result.stderr.includes("ftp-user"), false);
+    assert.equal(result.stderr.includes("ftp-password"), false);
     assert.ok(result.stderr.length <= 513, `stderr length was ${result.stderr.length}`);
     assert.match(result.stderr, /\[REDACTED\]/u);
   });

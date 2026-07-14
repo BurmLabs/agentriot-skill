@@ -257,10 +257,10 @@ function sanitizeServerError(message, args) {
   }
 
   sanitized = sanitized
-    .replace(/\b(https?:\/\/)[^/\s@]+@/giu, "$1[REDACTED]@")
+    .replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^/\s@]+@/giu, "$1[REDACTED]@")
     .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/giu, "Bearer [REDACTED]")
     .replace(/\b(?:agrt|sk)[_-][A-Za-z0-9._~+/=-]{6,}/giu, "[REDACTED]")
-    .replace(/(\b(?:api[-_]?key|x-api-key|recovery[-_]?token)\b["']?\s*[:=]\s*["']?)([^"',;\s}\]]+)/giu, "$1[REDACTED]");
+    .replace(/(\b(?:api(?:[-_\s]?key)|x[-_\s]?api[-_\s]?key|recovery(?:[-_\s]?token))\b["']?\s*[:=]\s*["']?)([^"',;\s}\]]+)/giu, "$1[REDACTED]");
 
   if (sanitized.length <= MAX_SERVER_ERROR_LENGTH) return sanitized;
   return `${sanitized.slice(0, MAX_SERVER_ERROR_LENGTH - 1)}…`;
