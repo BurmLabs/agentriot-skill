@@ -519,9 +519,14 @@ test("register generates and persists a stable installation identity with return
   }, async (baseUrl) => {
     const result = await runCli(["register", "--input", inputPath, "--base-url", baseUrl, "--confirm-write", "true"]);
 
-    assert.equal(seenBody.name, "Lifecycle Agent");
     assert.equal(typeof seenBody.installationId, "string");
     assert.ok(seenBody.installationId.length > 20);
+    assert.deepEqual(seenBody, {
+      name: "Lifecycle Agent",
+      tagline: "Uses AgentRiot.",
+      description: "Exercises registration.",
+      installationId: seenBody.installationId,
+    });
     assert.deepEqual(result, {
       ok: true,
       command: "register",
@@ -1906,6 +1911,9 @@ test("remaining public writes independently preflight dry-run and missing-confir
     tagline: "Uses AgentRiot.",
     description: "Exercises registration guards.",
   });
+  const registerStatePath = `${registerPath}.explicit-state.json`;
+  const seededRegisterState = '{"installationId":"install_seeded_1234567890","agentSlug":"seeded-agent","apiKey":"agrt_seeded_key"}\n';
+  await writeFile(registerStatePath, seededRegisterState, "utf8");
   const updatePath = await writePayload("edit-update-guards.json", {
     title: "Updated launch note",
     summary: "Clarifies the public launch summary.",
@@ -1921,7 +1929,11 @@ test("remaining public writes independently preflight dry-run and missing-confir
   const playbookPath = await writePayload("playbook-guards.json", validPlaybookPayload());
   const avatarPath = await writeTempFile("avatar-guards.png", pngFixture(256, 256));
   const cases = [
-    { command: "register", args: ["--input", registerPath] },
+    {
+      command: "register",
+      args: ["--input", registerPath, "--state-file", registerStatePath],
+      statePath: registerStatePath,
+    },
     {
       command: "edit-update",
       args: ["--input", updatePath, "--slug", "lifecycle-agent", "--update-slug", "launch-update", "--api-key", "agrt_test_key"],
@@ -1949,6 +1961,9 @@ test("remaining public writes independently preflight dry-run and missing-confir
       for (const phase of ["dry-run", "missing-confirmation"]) {
         let preflightRequests = 0;
         let mutationRequests = 0;
+        const stateBefore = commandCase.statePath
+          ? await readFile(commandCase.statePath, "utf8")
+          : null;
 
         await withServer((request, response) => {
           if (request.url === "/api/agent-protocol") {
@@ -1980,6 +1995,10 @@ test("remaining public writes independently preflight dry-run and missing-confir
           : 1;
         assert.equal(preflightRequests, expectedPreflights, `${commandCase.command} ${phase} preflight`);
         assert.equal(mutationRequests, 0, `${commandCase.command} ${phase} mutation`);
+        if (commandCase.statePath) {
+          const stateAfter = await readFile(commandCase.statePath, "utf8");
+          assert.equal(stateAfter, stateBefore, `${commandCase.command} ${phase} state bytes`);
+        }
       }
     });
   }
@@ -2435,10 +2454,12 @@ const DELETE_CASES = [
 
 for (const deletion of DELETE_CASES) {
   test(`${deletion.command} deletes an existing public resource`, async () => {
+    let preflightRequests = 0;
     let mutationRequests = 0;
 
     await withServer((request, response) => {
       if (request.url === "/api/agent-protocol") {
+        preflightRequests += 1;
         response.writeHead(200, { "content-type": "application/json" });
         response.end(JSON.stringify(protocolResponse()));
         return;
@@ -2475,6 +2496,7 @@ for (const deletion of DELETE_CASES) {
         publicPath: deletion.publicPath,
         publicUrl: `${baseUrl}${deletion.publicPath}`,
       });
+      assert.equal(preflightRequests, 1);
       assert.equal(mutationRequests, 1);
     });
   });
