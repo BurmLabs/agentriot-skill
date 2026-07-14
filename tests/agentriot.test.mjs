@@ -492,15 +492,21 @@ test("register generates and persists a stable installation identity with return
   });
   const statePath = `${inputPath}.agentriot-state.json`;
   let seenBody = null;
+  let preflightRequests = 0;
+  let mutationRequests = 0;
 
   await withServer(async (request, response) => {
     if (request.url === "/api/agent-protocol") {
+      preflightRequests += 1;
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify(protocolResponse()));
       return;
     }
 
+    mutationRequests += 1;
+    assert.equal(request.method, "POST");
     assert.equal(request.url, "/api/agents/register");
+    assert.equal(request.headers["x-api-key"], undefined);
     const body = JSON.parse(await readRequestBody(request));
     seenBody = body;
 
@@ -513,14 +519,24 @@ test("register generates and persists a stable installation identity with return
   }, async (baseUrl) => {
     const result = await runCli(["register", "--input", inputPath, "--base-url", baseUrl, "--confirm-write", "true"]);
 
-    assert.equal(result.ok, true);
-    assert.equal(result.command, "register");
     assert.equal(seenBody.name, "Lifecycle Agent");
     assert.equal(typeof seenBody.installationId, "string");
     assert.ok(seenBody.installationId.length > 20);
-    assert.equal(result.agent.slug, "lifecycle-agent");
-    assert.equal(result.keyPrefix, "agrt_sec");
-    assert.equal(result.registrationStatus, "created");
+    assert.deepEqual(result, {
+      ok: true,
+      command: "register",
+      registrationStatus: "created",
+      agent: { id: "agt_1", slug: "lifecycle-agent", name: "Lifecycle Agent" },
+      installationId: seenBody.installationId,
+      apiKey: "agrt_secret",
+      keyPrefix: "agrt_sec",
+      apiKeyReturned: true,
+      stateFile: statePath,
+      storedApiKeyAvailable: true,
+      recovery: null,
+    });
+    assert.equal(preflightRequests, 1);
+    assert.equal(mutationRequests, 1);
 
     const state = await readJsonFile(statePath);
     assert.equal(state.installationId, result.installationId);
@@ -1359,14 +1375,18 @@ test("upload-avatar dry-run validates file metadata and preflights without uploa
 test("upload-avatar posts multipart form data with API key header", async () => {
   const avatarPath = await writeTempFile("avatar.png", pngFixture(256, 256));
   const seen = {};
+  let preflightRequests = 0;
+  let mutationRequests = 0;
 
   await withServer(async (request, response) => {
     if (request.url === "/api/agent-protocol") {
+      preflightRequests += 1;
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify(protocolResponse()));
       return;
     }
 
+    mutationRequests += 1;
     assert.equal(request.url, "/api/agents/lifecycle-agent/avatar");
     assert.equal(request.method, "POST");
     assert.equal(request.headers["x-api-key"], "agrt_secret_key");
@@ -1397,14 +1417,29 @@ test("upload-avatar posts multipart form data with API key header", async () => 
     ]);
     const serialized = JSON.stringify(result);
 
-    assert.equal(result.ok, true);
-    assert.equal(result.command, "upload-avatar");
-    assert.equal(result.publicPath, "/uploads/agents/lifecycle-agent/avatar.png");
-    assert.equal(result.avatarUrl, `${baseUrl}/uploads/agents/lifecycle-agent/avatar.png`);
-    assert.equal(result.file.width, 256);
-    assert.equal(result.file.height, 256);
+    assert.deepEqual(result, {
+      ok: true,
+      command: "upload-avatar",
+      avatar: {
+        id: "avatar_1",
+        path: "/uploads/agents/lifecycle-agent/avatar.png",
+      },
+      publicPath: "/uploads/agents/lifecycle-agent/avatar.png",
+      avatarUrl: `${baseUrl}/uploads/agents/lifecycle-agent/avatar.png`,
+      file: {
+        name: "avatar.png",
+        bytes: 33,
+        contentType: "image/png",
+        width: 256,
+        height: 256,
+        field: "file",
+      },
+      warnings: [],
+    });
     assert.match(seen.body, /name="file"; filename="avatar\.png"/u);
     assert.match(seen.body, /Content-Type: image\/png/u);
+    assert.equal(preflightRequests, 1);
+    assert.equal(mutationRequests, 1);
     assert.equal(serialized.includes("agrt_secret_key"), false);
   });
 });
@@ -1823,39 +1858,129 @@ test("core public writes support dry-run and reject missing confirmation without
       const inputPath = commandCase.payload
         ? await writePayload(`${commandCase.command}.json`, commandCase.payload)
         : null;
-      let preflightRequests = 0;
-      let operationRequests = 0;
+      const baseArgs = [
+        commandCase.command,
+        ...commandCase.args,
+        ...(inputPath ? ["--input", inputPath] : []),
+      ];
 
-      await withServer((request, response) => {
-        if (request.url === "/api/agent-protocol") {
-          preflightRequests += 1;
-          response.writeHead(200, { "content-type": "application/json" });
-          response.end(JSON.stringify(protocolResponse()));
-          return;
-        }
+      for (const phase of ["dry-run", "missing-confirmation"]) {
+        let preflightRequests = 0;
+        let operationRequests = 0;
 
-        operationRequests += 1;
-        response.writeHead(500, { "content-type": "application/json" });
-        response.end(JSON.stringify({ error: "unexpected mutation" }));
-      }, async (baseUrl) => {
-        const baseArgs = [
-          commandCase.command,
-          ...commandCase.args,
-          ...(inputPath ? ["--input", inputPath] : []),
-          "--base-url",
-          baseUrl,
-        ];
-        const dryRun = await runCli([...baseArgs, "--dry-run", "true"]);
-        const missingConfirmation = await runCliFailure(baseArgs);
+        await withServer((request, response) => {
+          if (request.url === "/api/agent-protocol") {
+            preflightRequests += 1;
+            response.writeHead(200, { "content-type": "application/json" });
+            response.end(JSON.stringify(protocolResponse()));
+            return;
+          }
 
-        assert.equal(dryRun.ok, true);
-        assert.equal(dryRun.command, commandCase.command);
-        assert.equal(dryRun.dryRun, true);
-        assert.equal(dryRun.contractVersion, "2026.05.16");
-        assert.match(missingConfirmation.stderr, /--confirm-write true is required for live writes/u);
-        assert.equal(preflightRequests, 2);
-        assert.equal(operationRequests, 0);
-      });
+          operationRequests += 1;
+          response.writeHead(500, { "content-type": "application/json" });
+          response.end(JSON.stringify({ error: "unexpected mutation" }));
+        }, async (baseUrl) => {
+          const args = [...baseArgs, "--base-url", baseUrl];
+          if (phase === "dry-run") {
+            const result = await runCli([...args, "--dry-run", "true"]);
+            assert.equal(result.ok, true);
+            assert.equal(result.command, commandCase.command);
+            assert.equal(result.dryRun, true);
+            assert.equal(result.contractVersion, "2026.05.16");
+          } else {
+            const result = await runCliFailure(args);
+            assert.match(result.stderr, /--confirm-write true is required for live writes/u);
+          }
+        });
+
+        assert.equal(preflightRequests, 1, `${commandCase.command} ${phase} preflight`);
+        assert.equal(operationRequests, 0, `${commandCase.command} ${phase} mutation`);
+      }
+    });
+  }
+});
+
+test("remaining public writes independently preflight dry-run and missing-confirmation phases", async (t) => {
+  const registerPath = await writePayload("register-guards.json", {
+    name: "Lifecycle Agent",
+    tagline: "Uses AgentRiot.",
+    description: "Exercises registration guards.",
+  });
+  const updatePath = await writePayload("edit-update-guards.json", {
+    title: "Updated launch note",
+    summary: "Clarifies the public launch summary.",
+    whatChanged: "Corrected the public-safe details.",
+    signalType: "status",
+  });
+  const promptPath = await writePayload("edit-prompt-guards.json", {
+    title: "Updated research brief",
+    description: "Clarifies when to use the prompt.",
+    prompt: "Summarize the notes into findings and risks.",
+    expectedOutput: "Findings and risks.",
+  });
+  const playbookPath = await writePayload("playbook-guards.json", validPlaybookPayload());
+  const avatarPath = await writeTempFile("avatar-guards.png", pngFixture(256, 256));
+  const cases = [
+    { command: "register", args: ["--input", registerPath] },
+    {
+      command: "edit-update",
+      args: ["--input", updatePath, "--slug", "lifecycle-agent", "--update-slug", "launch-update", "--api-key", "agrt_test_key"],
+    },
+    {
+      command: "edit-prompt",
+      args: ["--input", promptPath, "--slug", "lifecycle-agent", "--prompt-slug", "research-brief", "--api-key", "agrt_test_key"],
+    },
+    {
+      command: "publish-playbook",
+      args: ["--input", playbookPath, "--slug", "lifecycle-agent", "--api-key", "agrt_test_key"],
+    },
+    {
+      command: "edit-playbook",
+      args: ["--input", playbookPath, "--slug", "lifecycle-agent", "--playbook-slug", "daily-launch-review", "--api-key", "agrt_test_key"],
+    },
+    {
+      command: "upload-avatar",
+      args: ["--file", avatarPath, "--slug", "lifecycle-agent", "--api-key", "agrt_test_key"],
+    },
+  ];
+
+  for (const commandCase of cases) {
+    await t.test(commandCase.command, async () => {
+      for (const phase of ["dry-run", "missing-confirmation"]) {
+        let preflightRequests = 0;
+        let mutationRequests = 0;
+
+        await withServer((request, response) => {
+          if (request.url === "/api/agent-protocol") {
+            preflightRequests += 1;
+            response.writeHead(200, { "content-type": "application/json" });
+            response.end(JSON.stringify(protocolResponse()));
+            return;
+          }
+
+          mutationRequests += 1;
+          response.writeHead(500, { "content-type": "application/json" });
+          response.end(JSON.stringify({ error: "unexpected mutation" }));
+        }, async (baseUrl) => {
+          const args = [commandCase.command, ...commandCase.args, "--base-url", baseUrl];
+          if (phase === "dry-run") {
+            const result = await runCli([...args, "--dry-run", "true"]);
+            assert.equal(result.ok, true);
+            assert.equal(result.command, commandCase.command);
+            assert.equal(result.dryRun, true);
+            assert.equal(result.contractVersion, "2026.05.16");
+          } else {
+            const result = await runCliFailure(args);
+            assert.match(result.stderr, /--confirm-write true is required for live writes/u);
+          }
+        });
+
+        const expectedPreflights = commandCase.command === "register" && phase === "missing-confirmation"
+          ? 0
+          : 1;
+        assert.equal(preflightRequests, expectedPreflights, `${commandCase.command} ${phase} preflight`);
+        assert.equal(mutationRequests, 0, `${commandCase.command} ${phase} mutation`);
+      }
     });
   }
 });
@@ -1914,14 +2039,18 @@ test("edit-update patches an existing timeline update", async () => {
     signalType: "status",
     skillsTools: ["release"],
   });
+  let preflightRequests = 0;
+  let mutationRequests = 0;
 
   await withServer(async (request, response) => {
     if (request.url === "/api/agent-protocol") {
+      preflightRequests += 1;
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify(protocolResponse()));
       return;
     }
 
+    mutationRequests += 1;
     assert.equal(request.method, "PATCH");
     assert.equal(request.url, "/api/agents/lifecycle-agent/updates/launch-update");
     assert.equal(request.headers["x-api-key"], "agrt_test_key");
@@ -1957,30 +2086,43 @@ test("edit-update patches an existing timeline update", async () => {
       "true",
     ]);
 
-    assert.equal(result.command, "edit-update");
-    assert.equal(result.publicPath, "/agents/lifecycle-agent/updates/launch-update");
+    assert.deepEqual(result, {
+      ok: true,
+      command: "edit-update",
+      id: "update_1",
+      publicPath: "/agents/lifecycle-agent/updates/launch-update",
+      publicUrl: `${baseUrl}/agents/lifecycle-agent/updates/launch-update`,
+    });
+    assert.equal(preflightRequests, 1);
+    assert.equal(mutationRequests, 1);
   });
 });
 
 test("edit-prompt patches an existing shared prompt", async () => {
-  const inputPath = await writePayload("prompt.json", {
+  const payload = {
     title: "Updated research brief",
     description: "Clarifies when to use the prompt.",
     prompt: "Summarize the notes into findings and risks.",
     expectedOutput: "Findings and risks.",
     tags: ["research"],
-  });
+  };
+  const inputPath = await writePayload("prompt.json", payload);
+  let preflightRequests = 0;
+  let mutationRequests = 0;
 
   await withServer(async (request, response) => {
     if (request.url === "/api/agent-protocol") {
+      preflightRequests += 1;
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify(protocolResponse()));
       return;
     }
 
+    mutationRequests += 1;
     assert.equal(request.method, "PATCH");
     assert.equal(request.url, "/api/agents/lifecycle-agent/prompts/research-brief");
     assert.equal(request.headers["x-api-key"], "agrt_test_key");
+    assert.deepEqual(JSON.parse(await readRequestBody(request)), payload);
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify({
       prompt: {
@@ -2007,8 +2149,15 @@ test("edit-prompt patches an existing shared prompt", async () => {
       "true",
     ]);
 
-    assert.equal(result.command, "edit-prompt");
-    assert.equal(result.publicPath, "/prompts/research-brief");
+    assert.deepEqual(result, {
+      ok: true,
+      command: "edit-prompt",
+      id: "prompt_1",
+      publicPath: "/prompts/research-brief",
+      publicUrl: `${baseUrl}/prompts/research-brief`,
+    });
+    assert.equal(preflightRequests, 1);
+    assert.equal(mutationRequests, 1);
   });
 });
 
@@ -2016,10 +2165,12 @@ test("publish-playbook posts a public playbook with API key header", async () =>
   const payload = validPlaybookPayload();
   const inputPath = await writePayload("playbook.json", payload);
   let seenBody = null;
+  let preflightRequests = 0;
   let mutationRequests = 0;
 
   await withServer(async (request, response) => {
     if (request.url === "/api/agent-protocol") {
+      preflightRequests += 1;
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify(protocolResponse()));
       return;
@@ -2055,12 +2206,24 @@ test("publish-playbook posts a public playbook with API key header", async () =>
     ]);
     const serialized = JSON.stringify(result);
 
-    assert.equal(result.ok, true);
-    assert.equal(result.command, "publish-playbook");
-    assert.equal(result.publicPath, "/playbooks/daily-launch-review");
-    assert.equal(result.publicUrl, `${baseUrl}/playbooks/daily-launch-review`);
-    assert.equal(result.playbook.slug, "daily-launch-review");
+    assert.deepEqual(result, {
+      ok: true,
+      command: "publish-playbook",
+      id: "playbook_1",
+      playbook: {
+        id: "playbook_1",
+        slug: "daily-launch-review",
+        title: payload.title,
+      },
+      canonicalPath: "/playbooks/daily-launch-review",
+      playbookPath: "/playbooks/daily-launch-review",
+      publicPath: "/playbooks/daily-launch-review",
+      canonicalUrl: `${baseUrl}/playbooks/daily-launch-review`,
+      publicUrl: `${baseUrl}/playbooks/daily-launch-review`,
+      validationWarnings: [],
+    });
     assert.deepEqual(seenBody, payload);
+    assert.equal(preflightRequests, 1);
     assert.equal(mutationRequests, 1);
     assert.equal(serialized.includes("agrt_secret_key"), false);
   });
@@ -2126,14 +2289,18 @@ test("edit-playbook patches an existing public playbook", async () => {
   const payload = validPlaybookPayload({ title: "Updated daily launch review" });
   const inputPath = await writePayload("playbook.json", payload);
   let seenBody = null;
+  let preflightRequests = 0;
+  let mutationRequests = 0;
 
   await withServer(async (request, response) => {
     if (request.url === "/api/agent-protocol") {
+      preflightRequests += 1;
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify(protocolResponse()));
       return;
     }
 
+    mutationRequests += 1;
     assert.equal(request.method, "PATCH");
     assert.equal(request.url, "/api/agents/lifecycle-agent/playbooks/daily-launch-review");
     assert.equal(request.headers["x-api-key"], "agrt_secret_key");
@@ -2164,11 +2331,25 @@ test("edit-playbook patches an existing public playbook", async () => {
       "true",
     ]);
 
-    assert.equal(result.ok, true);
-    assert.equal(result.command, "edit-playbook");
-    assert.equal(result.publicPath, "/playbooks/daily-launch-review");
-    assert.equal(result.publicUrl, `${baseUrl}/playbooks/daily-launch-review`);
+    assert.deepEqual(result, {
+      ok: true,
+      command: "edit-playbook",
+      id: "playbook_1",
+      playbook: {
+        id: "playbook_1",
+        slug: "daily-launch-review",
+        title: payload.title,
+      },
+      canonicalPath: "/playbooks/daily-launch-review",
+      playbookPath: "/playbooks/daily-launch-review",
+      publicPath: "/playbooks/daily-launch-review",
+      canonicalUrl: `${baseUrl}/playbooks/daily-launch-review`,
+      publicUrl: `${baseUrl}/playbooks/daily-launch-review`,
+      validationWarnings: [],
+    });
     assert.deepEqual(seenBody, payload);
+    assert.equal(preflightRequests, 1);
+    assert.equal(mutationRequests, 1);
   });
 });
 
@@ -2440,44 +2621,43 @@ test("delete dry-run performs only protocol preflight for all commands", async (
 
 test("delete confirmation rejects missing and false values without DELETE", async () => {
   for (const deletion of DELETE_CASES) {
-    let preflightRequests = 0;
-    let deleteRequests = 0;
+    for (const confirmation of ["missing", "false"]) {
+      let preflightRequests = 0;
+      let deleteRequests = 0;
 
-    await withServer((request, response) => {
-      if (request.url === "/api/agent-protocol") {
-        preflightRequests += 1;
-        response.writeHead(200, { "content-type": "application/json" });
-        response.end(JSON.stringify(protocolResponse()));
-        return;
-      }
+      await withServer((request, response) => {
+        if (request.url === "/api/agent-protocol") {
+          preflightRequests += 1;
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end(JSON.stringify(protocolResponse()));
+          return;
+        }
 
-      if (request.method === "DELETE") deleteRequests += 1;
-      response.writeHead(500, { "content-type": "application/json" });
-      response.end(JSON.stringify({ error: "unexpected mutation" }));
-    }, async (baseUrl) => {
-      const baseArgs = [
-        deletion.command,
-        "--slug",
-        "lifecycle-agent",
-        `--${deletion.slugFlag}`,
-        deletion.itemSlug,
-        "--api-key",
-        "agrt_test_key",
-        "--base-url",
-        baseUrl,
-      ];
-      const missing = await runCliFailure(baseArgs);
-      const explicitlyFalse = await runCliFailure([
-        ...baseArgs,
-        "--confirm-write",
-        "false",
-      ]);
+        if (request.method === "DELETE") deleteRequests += 1;
+        response.writeHead(500, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: "unexpected mutation" }));
+      }, async (baseUrl) => {
+        const baseArgs = [
+          deletion.command,
+          "--slug",
+          "lifecycle-agent",
+          `--${deletion.slugFlag}`,
+          deletion.itemSlug,
+          "--api-key",
+          "agrt_test_key",
+          "--base-url",
+          baseUrl,
+        ];
+        const result = await runCliFailure(confirmation === "false"
+          ? [...baseArgs, "--confirm-write", "false"]
+          : baseArgs);
 
-      assert.match(missing.stderr, /--confirm-write true is required for live writes/u);
-      assert.match(explicitlyFalse.stderr, /--confirm-write true is required for live writes/u);
-      assert.equal(preflightRequests, 2);
-      assert.equal(deleteRequests, 0);
-    });
+        assert.match(result.stderr, /--confirm-write true is required for live writes/u);
+      });
+
+      assert.equal(preflightRequests, 1, `${deletion.command} ${confirmation} preflight`);
+      assert.equal(deleteRequests, 0, `${deletion.command} ${confirmation} mutation`);
+    }
   }
 });
 
