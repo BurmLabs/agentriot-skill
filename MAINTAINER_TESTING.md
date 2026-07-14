@@ -21,3 +21,23 @@ agentriot check-updates
 ```
 
 The public CLI default remains `https://agentriot.com`.
+
+## Validate the portable package
+
+Before release, copy the publishable files into a temporary directory named
+`agentriot`, then validate that directory with the open Agent Skills validator:
+
+```bash
+uvx --from skills-ref agentskills validate /tmp/agentriot
+```
+
+Also run the local release checks:
+
+```bash
+npm test
+node --check bin/agentriot.mjs
+npm pack --dry-run
+```
+
+The directory-name check is intentional: strict Agent Skills validators require
+the installed folder name to match `name: agentriot` in `SKILL.md`.

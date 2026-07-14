@@ -236,7 +236,7 @@ test("check-updates compares local skill version to protocol metadata", async ()
     assert.equal(result.command, "check-updates");
     assert.equal(result.upToDate, true);
     assert.equal(result.meetsMinimum, true);
-    assert.equal(result.localSkill.version, "0.10.1");
+    assert.equal(result.localSkill.version, "0.11.0");
   });
 });
 
@@ -2401,6 +2401,107 @@ test("skill frontmatter is GitHub-compatible YAML", async () => {
   assert.ok(frontmatter);
   assert.match(frontmatter, /^name: agentriot$/m);
   assert.match(frontmatter, /^description: "/m);
+});
+
+test("portable skill frontmatter uses standard fields and broad AgentRiot triggers", async () => {
+  const skill = await readFile(new URL("../SKILL.md", import.meta.url), "utf8");
+  const frontmatter = skill.match(/^---\n(?<yaml>[\s\S]*?)\n---/u)?.groups?.yaml;
+
+  assert.ok(frontmatter);
+  assert.match(frontmatter, /^name: agentriot$/mu);
+  assert.match(frontmatter, /^license: MIT$/mu);
+  assert.match(frontmatter, /^compatibility: /mu);
+  assert.doesNotMatch(frontmatter, /^(allowed-tools|metadata|model):/mu);
+
+  for (const trigger of [
+    "autonomous agent",
+    "operator",
+    "join AgentRiot",
+    "profile",
+    "updates",
+    "prompts",
+    "Playbooks",
+    "Agent Loops",
+    "avatar",
+    "feed",
+    "credentials",
+    "registration state",
+    "remove public work",
+    "protocol",
+  ]) {
+    assert.ok(frontmatter.includes(trigger), `missing portable trigger: ${trigger}`);
+  }
+});
+
+test("portable skill documents bundled execution fallback and safe mutation flow", async () => {
+  const skill = await readFile(new URL("../SKILL.md", import.meta.url), "utf8");
+
+  assert.match(skill, /Use `agentriot` when it is available/u);
+  assert.match(skill, /node <skill-root>\/bin\/agentriot\.mjs <command>/u);
+  assert.doesNotMatch(skill, /\{baseDir\}|\$\{HERMES_SKILL_DIR\}/u);
+
+  for (const required of [
+    "check-updates",
+    "validate",
+    "--dry-run true",
+    "exact public mutation",
+    "--confirm-write true",
+    "verify",
+    "--skip-contract-check true",
+    "compatibility risk",
+  ]) {
+    assert.ok(skill.includes(required), `missing safe workflow phrase: ${required}`);
+  }
+});
+
+test("install guidance covers shared and major runtime skill directories", async () => {
+  const readme = await readFile(new URL("../README.md", import.meta.url), "utf8");
+
+  for (const installPath of [
+    ".agents/skills/agentriot",
+    ".openclaw/skills/agentriot",
+    ".hermes/skills/agentriot",
+    ".codex/skills/agentriot",
+    ".claude/skills/agentriot",
+    ".gemini/skills/agentriot",
+    ".copilot/skills/agentriot",
+  ]) {
+    assert.ok(readme.includes(installPath), `missing install directory: ${installPath}`);
+  }
+
+  assert.match(readme, /directory named `agentriot`/u);
+  assert.match(readme, /same `SKILL\.md`, `bin\/`, and `references\/`/u);
+  assert.doesNotMatch(readme, /separate (OpenClaw|Hermes|Codex|Claude|Gemini|Copilot) skill/iu);
+});
+
+test("payload references provide a compact contents list", async () => {
+  const payloads = await readFile(new URL("../references/payloads.md", import.meta.url), "utf8");
+
+  assert.match(payloads, /## Contents/u);
+  for (const section of [
+    "Registration and profile payload",
+    "Update payload",
+    "Prompt payload",
+    "Playbook payload",
+    "Loop payload",
+    "Avatar upload",
+    "Feed stream",
+  ]) {
+    assert.match(payloads, new RegExp(`\\[${section}\\]\\(#[^)]+\\)`, "iu"));
+  }
+});
+
+test("published version artifacts stay synchronized at 0.11.0", async () => {
+  const root = new URL("../", import.meta.url);
+  const packageJson = JSON.parse(await readFile(new URL("package.json", root), "utf8"));
+  const cli = await readFile(new URL("bin/agentriot.mjs", root), "utf8");
+  const readme = await readFile(new URL("README.md", root), "utf8");
+  const apiReference = await readFile(new URL("references/public-api.md", root), "utf8");
+
+  assert.equal(packageJson.version, "0.11.0");
+  assert.match(cli, /const LOCAL_SKILL_VERSION = "0\.11\.0";/u);
+  assert.match(readme, /package version is `0\.11\.0`/u);
+  assert.match(apiReference, /package version is `0\.11\.0`/u);
 });
 
 test("public docs link to canonical AgentRiot references", async () => {
