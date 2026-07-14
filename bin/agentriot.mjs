@@ -1,13 +1,19 @@
 #!/usr/bin/env node
-import { randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { basename, dirname, extname } from "node:path";
+import { readFile, stat } from "node:fs/promises";
+import { basename, extname } from "node:path";
 import {
   assertWriteConfirmed,
   booleanArg,
   parseArgs,
 } from "./lib/args.mjs";
 import { readImageDimensions } from "./lib/image-dimensions.mjs";
+import {
+  maskCredential,
+  maskValue,
+  readRegistrationState,
+  stableInstallationId,
+  writeRegistrationStateAtomic,
+} from "./lib/state.mjs";
 
 const DEFAULT_BASE_URL = "https://agentriot.com";
 const DEFAULT_TIMEOUT_MS = 30000;
@@ -81,6 +87,14 @@ const AGENT_SIGNAL_TYPES = new Set([
 
 function fail(message) {
   throw new Error(message);
+}
+
+class CliRecoveryError extends Error {
+  constructor(message, stdout) {
+    super(message);
+    this.name = "CliRecoveryError";
+    this.stdout = stdout;
+  }
 }
 
 function compareVersions(left, right) {
@@ -183,62 +197,6 @@ function stateCommandPath(args) {
   const filePath = args["state-file"] ?? process.env.AGENTRIOT_STATE_FILE ?? (args.input ? `${args.input}.agentriot-state.json` : null);
   if (!filePath) fail("--state-file or AGENTRIOT_STATE_FILE is required");
   return filePath;
-}
-
-async function readRegistrationState(filePath, options = {}) {
-  try {
-    const parsed = JSON.parse(await readFile(filePath, "utf8"));
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      if (options.required) {
-        fail(`Registration state file not found: ${filePath}`);
-      }
-      return {};
-    }
-
-    fail(`Unable to read registration state: ${error.message}`);
-  }
-}
-
-function stableInstallationId(payload, state) {
-  if (typeof state.installationId === "string" && state.installationId.trim()) {
-    return state.installationId.trim();
-  }
-
-  if (typeof payload.installationId === "string" && payload.installationId.trim()) {
-    return payload.installationId.trim();
-  }
-
-  return `install_${randomUUID()}`;
-}
-
-async function writeRegistrationState(filePath, state) {
-  await mkdir(dirname(filePath), { recursive: true });
-  try {
-    await chmod(filePath, 0o600);
-  } catch (error) {
-    if (error.code !== "ENOENT") {
-      fail(`Unable to secure registration state file before write: ${error.message}`);
-    }
-  }
-  await writeFile(filePath, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-  await chmod(filePath, 0o600);
-  const readback = await readRegistrationState(filePath);
-
-  if (readback.installationId !== state.installationId) {
-    fail("Registration state readback failed for installationId.");
-  }
-
-  if (state.agentSlug && readback.agentSlug !== state.agentSlug) {
-    fail("Registration state readback failed for agentSlug.");
-  }
-
-  if (state.apiKey && readback.apiKey !== state.apiKey) {
-    fail("Registration state readback failed for apiKey.");
-  }
-
-  return readback;
 }
 
 function fieldPath(detail) {
@@ -858,11 +816,6 @@ function assertValid(type, payload) {
   return validation;
 }
 
-function maskValue(value, visible = 8) {
-  if (typeof value !== "string" || value.length === 0) return null;
-  return `${value.slice(0, Math.min(visible, value.length))}...`;
-}
-
 async function stateCommand(args) {
   const statePath = stateCommandPath(args);
   const state = await readRegistrationState(statePath, { required: true });
@@ -875,14 +828,8 @@ async function stateCommand(args) {
     stateFile: statePath,
     installationId: maskValue(state.installationId, 11),
     agentSlug: maskValue(state.agentSlug, 7),
-    apiKey: {
-      available: Boolean(apiKey),
-      prefix: apiKey ? apiKey.slice(0, 8) : null,
-    },
-    recoveryToken: {
-      available: Boolean(recoveryToken),
-      prefix: recoveryToken ? recoveryToken.slice(0, 8) : null,
-    },
+    apiKey: maskCredential(apiKey),
+    recoveryToken: maskCredential(recoveryToken),
   };
 }
 
@@ -986,9 +933,9 @@ async function registerAgent(args, payload) {
     installationId,
   };
   const validation = assertValid("register", requestPayload);
-  const preflight = await protocolPreflight(args);
 
   if (args["dry-run"]) {
+    const preflight = await protocolPreflight(args);
     return {
       ok: true,
       command: "register",
@@ -1002,6 +949,11 @@ async function registerAgent(args, payload) {
   }
 
   assertWriteConfirmed(args);
+  await writeRegistrationStateAtomic(statePath, {
+    ...state,
+    installationId,
+  });
+  const preflight = await protocolPreflight(args);
   const data = await postJson(`${baseUrl}/api/agents/register`, requestPayload, {}, args);
   const apiKey = typeof data.apiKey === "string" ? data.apiKey : "";
   const agentSlug = typeof data.agent?.slug === "string" ? data.agent.slug : state.agentSlug;
@@ -1010,12 +962,34 @@ async function registerAgent(args, payload) {
     fail("Registration response did not include an agent slug.");
   }
 
-  const persisted = await writeRegistrationState(statePath, {
-    ...state,
-    installationId,
-    agentSlug,
-    ...(apiKey ? { apiKey } : {}),
-  });
+  let persisted;
+  try {
+    persisted = await writeRegistrationStateAtomic(statePath, {
+      ...state,
+      installationId,
+      agentSlug,
+      ...(apiKey ? { apiKey } : {}),
+    });
+  } catch (error) {
+    if (!apiKey) throw error;
+
+    throw new CliRecoveryError(
+      "Registration succeeded, but credential state could not be persisted. Save the API key from stdout and retry state persistence before continuing.",
+      {
+        ok: false,
+        command: "register",
+        registrationStatus: data.registrationStatus ?? "created",
+        agent: data.agent,
+        installationId,
+        apiKey,
+        keyPrefix: apiKey.slice(0, 8),
+        apiKeyReturned: true,
+        stateFile: statePath,
+        statePersisted: false,
+        recovery: data.recovery ?? null,
+      },
+    );
+  }
 
   return {
     ok: true,
@@ -1706,6 +1680,9 @@ main()
     console.log(JSON.stringify(result, null, 2));
   })
   .catch((error) => {
+    if (error instanceof CliRecoveryError) {
+      console.log(JSON.stringify(error.stdout, null, 2));
+    }
     console.error(error.message);
-    process.exit(1);
+    process.exitCode = 1;
   });

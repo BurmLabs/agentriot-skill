@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, readdir, rename, stat, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -526,6 +526,172 @@ test("register generates and persists a stable installation identity with return
     assert.equal(state.agentSlug, "lifecycle-agent");
     assert.equal(state.apiKey, "agrt_secret");
   });
+});
+
+test("state atomic writes reject symlink destinations", async () => {
+  const { writeRegistrationStateAtomic } = await import("../bin/lib/state.mjs");
+  const dir = await mkdtemp(join(tmpdir(), "agentriot-state-"));
+  const targetPath = join(dir, "target.json");
+  const statePath = join(dir, "state.json");
+  const original = '{"installationId":"install_target"}\n';
+  await writeFile(targetPath, original, "utf8");
+  await symlink(targetPath, statePath);
+
+  await assert.rejects(
+    writeRegistrationStateAtomic(statePath, {
+      installationId: "install_replacement",
+    }),
+    /symbolic link/u,
+  );
+
+  assert.equal(await readFile(targetPath, "utf8"), original);
+});
+
+test("state atomic writes replace permissive files with owner-only permissions", async () => {
+  const { writeRegistrationStateAtomic } = await import("../bin/lib/state.mjs");
+  const dir = await mkdtemp(join(tmpdir(), "agentriot-state-"));
+  const statePath = join(dir, "state.json");
+  await writeFile(statePath, '{"installationId":"install_old"}\n', {
+    encoding: "utf8",
+    mode: 0o644,
+  });
+
+  await writeRegistrationStateAtomic(statePath, {
+    installationId: "install_new",
+    agentSlug: "lifecycle-agent",
+  });
+
+  assert.equal((await stat(statePath)).mode & 0o777, 0o600);
+  assert.deepEqual(await readJsonFile(statePath), {
+    installationId: "install_new",
+    agentSlug: "lifecycle-agent",
+  });
+});
+
+test("state atomic write failure preserves the complete prior file", async () => {
+  const { writeRegistrationStateAtomic } = await import("../bin/lib/state.mjs");
+  const dir = await mkdtemp(join(tmpdir(), "agentriot-state-"));
+  const statePath = join(dir, "state.json");
+  const original = '{"installationId":"install_existing"}\n';
+  await writeFile(statePath, original, { encoding: "utf8", mode: 0o600 });
+  await chmod(dir, 0o500);
+
+  try {
+    await assert.rejects(
+      writeRegistrationStateAtomic(statePath, {
+        installationId: "install_replacement",
+      }),
+      /Unable to persist registration state/u,
+    );
+  } finally {
+    await chmod(dir, 0o700);
+  }
+
+  assert.equal(await readFile(statePath, "utf8"), original);
+  assert.deepEqual(await readdir(dir), ["state.json"]);
+});
+
+test("registration persistence stores installation identity before network access", async () => {
+  const inputPath = await writePayload("register.json", {
+    name: "Lifecycle Agent",
+    tagline: "Uses AgentRiot.",
+    description: "Exercises registration.",
+  });
+  const statePath = `${inputPath}.agentriot-state.json`;
+  let persistedBeforeFirstRequest = null;
+  let registrationInstallationId = null;
+
+  await withServer(async (request, response) => {
+    if (persistedBeforeFirstRequest === null) {
+      try {
+        persistedBeforeFirstRequest = await readJsonFile(statePath);
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+      }
+    }
+
+    if (request.url === "/api/agent-protocol") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(protocolResponse()));
+      return;
+    }
+
+    assert.equal(request.url, "/api/agents/register");
+    const body = JSON.parse(await readRequestBody(request));
+    registrationInstallationId = body.installationId;
+    response.writeHead(201, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      registrationStatus: "created",
+      agent: { id: "agt_1", slug: "lifecycle-agent", name: "Lifecycle Agent" },
+      apiKey: "agrt_one_time_key",
+    }));
+  }, async (baseUrl) => {
+    await runCli([
+      "register",
+      "--input",
+      inputPath,
+      "--base-url",
+      baseUrl,
+      "--confirm-write",
+      "true",
+    ]);
+  });
+
+  assert.equal(typeof persistedBeforeFirstRequest.installationId, "string");
+  assert.ok(persistedBeforeFirstRequest.installationId.length > 20);
+  assert.equal(registrationInstallationId, persistedBeforeFirstRequest.installationId);
+});
+
+test("registration persistence failure returns the one-time key only in recovery stdout", async () => {
+  const inputPath = await writePayload("register.json", {
+    name: "Lifecycle Agent",
+    tagline: "Uses AgentRiot.",
+    description: "Exercises registration.",
+  });
+  const statePath = `${inputPath}.agentriot-state.json`;
+  const symlinkTarget = join(tmpdir(), `agentriot-recovery-${Date.now()}.json`);
+  const oneTimeKey = "agrt_one_time_recovery_key";
+
+  await withServer(async (request, response) => {
+    if (request.url === "/api/agent-protocol") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(protocolResponse()));
+      return;
+    }
+
+    assert.equal(request.url, "/api/agents/register");
+    await writeFile(symlinkTarget, '{"untouched":true}\n', "utf8");
+    await symlink(symlinkTarget, `${statePath}.replacement`);
+    await rename(`${statePath}.replacement`, statePath);
+    response.writeHead(201, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      registrationStatus: "created",
+      agent: { id: "agt_1", slug: "lifecycle-agent", name: "Lifecycle Agent" },
+      apiKey: oneTimeKey,
+    }));
+  }, async (baseUrl) => {
+    const failure = await runCliFailure([
+      "register",
+      "--input",
+      inputPath,
+      "--base-url",
+      baseUrl,
+      "--confirm-write",
+      "true",
+    ]);
+    const recovery = JSON.parse(failure.stdout);
+
+    assert.equal(failure.code, 1);
+    assert.equal(recovery.ok, false);
+    assert.equal(recovery.command, "register");
+    assert.equal(recovery.statePersisted, false);
+    assert.equal(recovery.apiKey, oneTimeKey);
+    assert.equal(recovery.stateFile, statePath);
+    assert.match(failure.stderr, /Registration succeeded, but credential state could not be persisted/u);
+    assert.equal(failure.stderr.includes(oneTimeKey), false);
+  });
+
+  assert.deepEqual(await readJsonFile(symlinkTarget), { untouched: true });
 });
 
 test("register writes credential state with owner-only permissions", async () => {
