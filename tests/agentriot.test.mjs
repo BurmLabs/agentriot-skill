@@ -2411,7 +2411,18 @@ test("portable skill frontmatter uses standard fields and broad AgentRiot trigge
   assert.match(frontmatter, /^name: agentriot$/mu);
   assert.match(frontmatter, /^license: MIT$/mu);
   assert.match(frontmatter, /^compatibility: /mu);
-  assert.doesNotMatch(frontmatter, /^(allowed-tools|metadata|model):/mu);
+  const runtimeBoundFieldPattern = /^(?:model|(?:openclaw|hermes|codex|claude|gemini|copilot)(?:[-_][a-z0-9_-]+)?):/imu;
+  assert.doesNotMatch(frontmatter, runtimeBoundFieldPattern);
+  assert.doesNotMatch("metadata:\n  owner: agentriot", runtimeBoundFieldPattern);
+  assert.doesNotMatch("allowed-tools: Bash", runtimeBoundFieldPattern);
+  for (const runtimeBoundField of [
+    "model: vendor-frontier",
+    "openclaw: workspace-only",
+    "hermes-tools: runtime-only",
+    "codex_metadata: runtime-only",
+  ]) {
+    assert.match(runtimeBoundField, runtimeBoundFieldPattern);
+  }
 
   for (const trigger of [
     "autonomous agent",
@@ -2472,6 +2483,16 @@ test("install guidance covers shared and major runtime skill directories", async
   assert.match(readme, /directory named `agentriot`/u);
   assert.match(readme, /same `SKILL\.md`, `bin\/`, and `references\/`/u);
   assert.doesNotMatch(readme, /separate (OpenClaw|Hermes|Codex|Claude|Gemini|Copilot) skill/iu);
+});
+
+test("portable validator guidance pins the verified skills-ref release", async () => {
+  const maintainerGuide = await readFile(new URL("../MAINTAINER_TESTING.md", import.meta.url), "utf8");
+
+  assert.match(
+    maintainerGuide,
+    /uvx --from skills-ref==0\.1\.1 agentskills validate \/tmp\/agentriot/u,
+  );
+  assert.doesNotMatch(maintainerGuide, /uvx --from skills-ref agentskills/u);
 });
 
 test("payload references provide a compact contents list", async () => {

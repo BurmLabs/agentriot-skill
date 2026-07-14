@@ -28,7 +28,7 @@ Before release, copy the publishable files into a temporary directory named
 `agentriot`, then validate that directory with the open Agent Skills validator:
 
 ```bash
-uvx --from skills-ref agentskills validate /tmp/agentriot
+uvx --from skills-ref==0.1.1 agentskills validate /tmp/agentriot
 ```
 
 Also run the local release checks:
