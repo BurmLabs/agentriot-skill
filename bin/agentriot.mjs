@@ -1,20 +1,30 @@
 #!/usr/bin/env node
-import { randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { basename, dirname, extname } from "node:path";
+import { readFile } from "node:fs/promises";
+import {
+  assertWriteConfirmed,
+  booleanArg,
+  parseArgs,
+} from "./lib/args.mjs";
+import { avatarLimits, readAvatarFile } from "./lib/avatar.mjs";
+import {
+  maskCredential,
+  maskValue,
+  readRegistrationState,
+  stableInstallationId,
+  writeRegistrationStateAtomic,
+} from "./lib/state.mjs";
 
 const DEFAULT_BASE_URL = "https://agentriot.com";
 const DEFAULT_TIMEOUT_MS = 30000;
+const MAX_SERVER_ERROR_LENGTH = 512;
+const MAX_JSON_RESPONSE_BYTES = 1024 * 1024;
+const MAX_SSE_EVENT_BYTES = 256 * 1024;
+const MAX_SSE_PENDING_BYTES = 512 * 1024;
+const MAX_SSE_AGGREGATE_BYTES = 2 * 1024 * 1024;
 const LOCAL_SKILL_NAME = "agentriot";
-const LOCAL_SKILL_VERSION = "0.10.1";
+const LOCAL_SKILL_VERSION = "0.11.0";
 const CONTRACT_VERSION = "2026.05.16";
-const AVATAR_MAX_BYTES = 2 * 1024 * 1024;
-const AVATAR_CONTENT_TYPES = Object.freeze({
-  ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg",
-  ".png": "image/png",
-  ".webp": "image/webp",
-});
+const AVATAR_MAX_BYTES = avatarLimits.maxBytes;
 const CONTRACT_LIMITS = Object.freeze({
   prompt: Object.freeze({
     title: 120,
@@ -55,8 +65,39 @@ const CONTRACT_LIMITS = Object.freeze({
   }),
 });
 const VALIDATION_TYPES = new Set(["profile", "update", "prompt", "playbook", "loop", "register"]);
-const WRITE_COMMANDS = new Set(["register", "update-profile", "publish-update", "edit-update", "publish-prompt", "edit-prompt", "publish-playbook", "edit-playbook", "upload-avatar", "claim", "rotate-key"]);
-const CREDENTIAL_COMMANDS = new Set(["register", "update-profile", "publish-update", "edit-update", "publish-prompt", "edit-prompt", "publish-playbook", "edit-playbook", "upload-avatar", "claim", "rotate-key", "mcp-config"]);
+const WRITE_COMMANDS = new Set(["register", "update-profile", "publish-update", "edit-update", "delete-update", "publish-prompt", "edit-prompt", "delete-prompt", "publish-playbook", "edit-playbook", "delete-playbook", "upload-avatar", "claim", "rotate-key"]);
+const CREDENTIAL_COMMANDS = new Set(["register", "update-profile", "publish-update", "edit-update", "delete-update", "publish-prompt", "edit-prompt", "delete-prompt", "publish-playbook", "edit-playbook", "delete-playbook", "upload-avatar", "claim", "rotate-key", "mcp-config"]);
+const BASE_URL_COMMANDS = new Set(["check-updates", "lookup-software", "profile", "mcp-config", "get-profile", "feed-stream", ...WRITE_COMMANDS]);
+const SENSITIVE_NAME_TERMS = new Set([
+  "apikey",
+  "recoverytoken",
+  "authorization",
+  "password",
+  "secret",
+]);
+const TOKEN_METRIC_TERMS = new Set(["budget", "count", "limit", "usage"]);
+const TOKEN_METRIC_QUALIFIERS = new Set([
+  ...TOKEN_METRIC_TERMS,
+  "cached",
+  "completion",
+  "context",
+  "estimated",
+  "input",
+  "max",
+  "maximum",
+  "min",
+  "minimum",
+  "model",
+  "output",
+  "prompt",
+  "reasoning",
+  "remaining",
+  "request",
+  "total",
+  "used",
+]);
+const COMPACT_TOKEN_METRIC_PATTERN = /^(?:(?:cached|completion|context|estimated|input|max|maximum|min|minimum|model|output|prompt|reasoning|remaining|request|total|used))*token(?:budget|count|limit|usage)$/u;
+const TOKENIZER_TERM_PATTERN = /^tokeniz(?:e|ed|er|ers|ing|ation|ations)$/u;
 const AGENT_SIGNAL_TYPES = new Set([
   "major_release",
   "launch",
@@ -74,6 +115,14 @@ function fail(message) {
   throw new Error(message);
 }
 
+class CliRecoveryError extends Error {
+  constructor(message, stdout) {
+    super(message);
+    this.name = "CliRecoveryError";
+    this.stdout = stdout;
+  }
+}
+
 function compareVersions(left, right) {
   const leftParts = String(left ?? "").split(".").map((part) => Number.parseInt(part, 10) || 0);
   const rightParts = String(right ?? "").split(".").map((part) => Number.parseInt(part, 10) || 0);
@@ -85,33 +134,6 @@ function compareVersions(left, right) {
   }
 
   return 0;
-}
-
-function parseArgs(argv) {
-  const [command, ...tokens] = argv;
-  const args = { command };
-
-  for (let index = 0; index < tokens.length; index += 1) {
-    const token = tokens[index];
-    if (!token.startsWith("--")) {
-      fail(`Unexpected argument: ${token}`);
-    }
-
-    const key = token.slice(2);
-    const value = tokens[index + 1];
-    if (!value || value.startsWith("--")) {
-      fail(`Missing value for --${key}`);
-    }
-
-    args[key] = value;
-    index += 1;
-  }
-
-  return args;
-}
-
-function boolArg(value) {
-  return value === true || String(value ?? "").toLowerCase() === "true";
 }
 
 async function readJsonPayload(inputPath) {
@@ -144,8 +166,70 @@ function assertObject(payload) {
   }
 }
 
+function normalizedPayloadKey(key) {
+  return String(key).toLowerCase().replace(/[^a-z0-9]/gu, "");
+}
+
+function semanticNameTokens(name) {
+  return String(name)
+    .replace(/([a-z0-9])([A-Z])/gu, "$1 $2")
+    .replace(/([A-Z]+)([A-Z][a-z])/gu, "$1 $2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/gu)
+    .filter(Boolean);
+}
+
+function isSafeTokenMetricName(tokens) {
+  const nonTokenTerms = tokens.filter((token) => token !== "token");
+  return tokens.includes("token")
+    && nonTokenTerms.length > 0
+    && nonTokenTerms.every((term) => TOKEN_METRIC_QUALIFIERS.has(term))
+    && nonTokenTerms.some((term) => TOKEN_METRIC_TERMS.has(term));
+}
+
+function isSensitivePayloadKey(key) {
+  const normalized = normalizedPayloadKey(key);
+  if (SENSITIVE_NAME_TERMS.has(normalized)) return true;
+
+  const tokens = semanticNameTokens(key);
+  for (let index = 0; index < tokens.length; index += 1) {
+    for (let length = 1; length <= 2 && index + length <= tokens.length; length += 1) {
+      if (SENSITIVE_NAME_TERMS.has(tokens.slice(index, index + length).join(""))) {
+        return true;
+      }
+    }
+  }
+  if (tokens.includes("token")) return !isSafeTokenMetricName(tokens);
+  if (!normalized.includes("token")) return false;
+  if (COMPACT_TOKEN_METRIC_PATTERN.test(normalized)) return false;
+
+  const tokenLikeTerms = tokens.filter((term) => term.includes("token"));
+  return tokenLikeTerms.length === 0
+    || !tokenLikeTerms.every((term) => TOKENIZER_TERM_PATTERN.test(term));
+}
+
+function assertNoSensitivePayloadKeys(value, path = [], seen = new WeakSet()) {
+  if (!value || typeof value !== "object") return;
+  if (seen.has(value)) return;
+  seen.add(value);
+
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => assertNoSensitivePayloadKeys(item, [...path, index], seen));
+    return;
+  }
+
+  for (const [key, child] of Object.entries(value)) {
+    const fieldPath = [...path, key].join(".");
+    if (isSensitivePayloadKey(key)) {
+      fail(`public payload must not include sensitive field ${fieldPath}`);
+    }
+    assertNoSensitivePayloadKeys(child, [...path, key], seen);
+  }
+}
+
 function payloadWithoutIgnoredFields(payload) {
   assertObject(payload);
+  assertNoSensitivePayloadKeys(payload);
 
   const cleaned = { ...payload };
   delete cleaned.timestamp;
@@ -153,9 +237,29 @@ function payloadWithoutIgnoredFields(payload) {
   return cleaned;
 }
 
+function normalizedBaseUrl(args) {
+  const rawBaseUrl = String(args["base-url"] ?? process.env.AGENTRIOT_BASE_URL ?? DEFAULT_BASE_URL);
+  let parsed;
+  try {
+    parsed = new URL(rawBaseUrl);
+  } catch {
+    fail("--base-url or AGENTRIOT_BASE_URL must be a valid absolute HTTP or HTTPS URL");
+  }
+
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    fail("--base-url or AGENTRIOT_BASE_URL must be a valid absolute HTTP or HTTPS URL");
+  }
+  if (parsed.username || parsed.password || rawBaseUrl.includes("?") || rawBaseUrl.includes("#")) {
+    fail("AgentRiot base URL must not include embedded credentials, a query string, or a fragment");
+  }
+
+  parsed.pathname = parsed.pathname.replace(/\/+$/u, "") || "/";
+  return parsed.toString().replace(/\/$/u, "");
+}
+
 function config(args) {
   return {
-    baseUrl: (args["base-url"] ?? process.env.AGENTRIOT_BASE_URL ?? DEFAULT_BASE_URL).replace(/\/+$/, ""),
+    baseUrl: normalizedBaseUrl(args),
     slug: args.slug ?? process.env.AGENTRIOT_AGENT_SLUG,
     apiKey: args["api-key"] ?? process.env.AGENTRIOT_API_KEY,
     recoveryToken: args["recovery-token"] ?? process.env.AGENTRIOT_RECOVERY_TOKEN,
@@ -179,13 +283,7 @@ function isLoopbackHostname(hostname) {
 function assertCredentialSafeBaseUrl(args) {
   if (!CREDENTIAL_COMMANDS.has(args.command)) return;
 
-  const { baseUrl } = config(args);
-  let parsed;
-  try {
-    parsed = new URL(baseUrl);
-  } catch {
-    fail("--base-url or AGENTRIOT_BASE_URL must be a valid absolute URL");
-  }
+  const parsed = new URL(config(args).baseUrl);
 
   if (parsed.protocol === "https:") return;
   if (parsed.protocol === "http:" && isLoopbackHostname(parsed.hostname)) return;
@@ -203,62 +301,6 @@ function stateCommandPath(args) {
   return filePath;
 }
 
-async function readRegistrationState(filePath, options = {}) {
-  try {
-    const parsed = JSON.parse(await readFile(filePath, "utf8"));
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      if (options.required) {
-        fail(`Registration state file not found: ${filePath}`);
-      }
-      return {};
-    }
-
-    fail(`Unable to read registration state: ${error.message}`);
-  }
-}
-
-function stableInstallationId(payload, state) {
-  if (typeof state.installationId === "string" && state.installationId.trim()) {
-    return state.installationId.trim();
-  }
-
-  if (typeof payload.installationId === "string" && payload.installationId.trim()) {
-    return payload.installationId.trim();
-  }
-
-  return `install_${randomUUID()}`;
-}
-
-async function writeRegistrationState(filePath, state) {
-  await mkdir(dirname(filePath), { recursive: true });
-  try {
-    await chmod(filePath, 0o600);
-  } catch (error) {
-    if (error.code !== "ENOENT") {
-      fail(`Unable to secure registration state file before write: ${error.message}`);
-    }
-  }
-  await writeFile(filePath, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-  await chmod(filePath, 0o600);
-  const readback = await readRegistrationState(filePath);
-
-  if (readback.installationId !== state.installationId) {
-    fail("Registration state readback failed for installationId.");
-  }
-
-  if (state.agentSlug && readback.agentSlug !== state.agentSlug) {
-    fail("Registration state readback failed for agentSlug.");
-  }
-
-  if (state.apiKey && readback.apiKey !== state.apiKey) {
-    fail("Registration state readback failed for apiKey.");
-  }
-
-  return readback;
-}
-
 function fieldPath(detail) {
   if (typeof detail?.field === "string" && detail.field.trim()) return detail.field.trim();
   if (Array.isArray(detail?.path) && detail.path.length > 0) return detail.path.map(String).join(".");
@@ -266,7 +308,28 @@ function fieldPath(detail) {
   return null;
 }
 
-function normalizeServerError(data, status) {
+function sanitizeServerError(message, args) {
+  const { apiKey, recoveryToken } = config(args);
+  const configuredSecrets = [apiKey, recoveryToken]
+    .filter((secret) => typeof secret === "string" && secret.length > 0)
+    .sort((left, right) => right.length - left.length);
+  let sanitized = String(message);
+
+  for (const secret of configuredSecrets) {
+    sanitized = sanitized.split(secret).join("[REDACTED]");
+  }
+
+  sanitized = sanitized
+    .replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^/\s@]+@/giu, "$1[REDACTED]@")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/giu, "Bearer [REDACTED]")
+    .replace(/\b(?:agrt|sk)[_-][A-Za-z0-9._~+/=-]{6,}/giu, "[REDACTED]")
+    .replace(/(\b(?:api(?:[-_\s]?key)|x[-_\s]?api[-_\s]?key|recovery(?:[-_\s]?token))\b["']?\s*[:=]\s*["']?)([^"',;\s}\]]+)/giu, "$1[REDACTED]");
+
+  if (sanitized.length <= MAX_SERVER_ERROR_LENGTH) return sanitized;
+  return `${sanitized.slice(0, MAX_SERVER_ERROR_LENGTH - 1)}…`;
+}
+
+function normalizeServerError(data, status, args = {}) {
   const base = typeof data.error === "string" ? data.error : `Request failed with ${status}`;
   const details = [];
 
@@ -289,7 +352,8 @@ function normalizeServerError(data, status) {
     }
   }
 
-  return details.length > 0 ? `${base}: ${details.join("; ")}` : base;
+  const normalized = details.length > 0 ? `${base}: ${details.join("; ")}` : base;
+  return sanitizeServerError(normalized, args);
 }
 
 async function fetchWithTimeout(url, options = {}, args = {}) {
@@ -308,6 +372,34 @@ async function fetchWithTimeout(url, options = {}, args = {}) {
   }
 }
 
+async function readBoundedJsonResponse(response) {
+  const declaredLength = Number.parseInt(response.headers.get("content-length") ?? "", 10);
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_JSON_RESPONSE_BYTES) {
+    await response.body?.cancel().catch(() => {});
+    fail("AgentRiot JSON response exceeded 1 MiB limit");
+  }
+
+  if (!response.body) return {};
+  const chunks = [];
+  let totalBytes = 0;
+  for await (const chunk of response.body) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    totalBytes += bytes.length;
+    if (totalBytes > MAX_JSON_RESPONSE_BYTES) {
+      await response.body.cancel().catch(() => {});
+      fail("AgentRiot JSON response exceeded 1 MiB limit");
+    }
+    chunks.push(bytes);
+  }
+
+  if (totalBytes === 0) return {};
+  try {
+    return JSON.parse(Buffer.concat(chunks, totalBytes).toString("utf8"));
+  } catch {
+    return {};
+  }
+}
+
 async function postJson(url, payload, headers = {}, args = {}) {
   const response = await fetchWithTimeout(url, {
     method: "POST",
@@ -317,10 +409,10 @@ async function postJson(url, payload, headers = {}, args = {}) {
     },
     body: JSON.stringify(payload),
   }, args);
-  const data = await response.json().catch(() => ({}));
+  const data = await readBoundedJsonResponse(response);
 
   if (!response.ok) {
-    fail(normalizeServerError(data, response.status));
+    fail(normalizeServerError(data, response.status, args));
   }
 
   return data;
@@ -335,10 +427,24 @@ async function patchJson(url, payload, headers = {}, args = {}) {
     },
     body: JSON.stringify(payload),
   }, args);
-  const data = await response.json().catch(() => ({}));
+  const data = await readBoundedJsonResponse(response);
 
   if (!response.ok) {
-    fail(normalizeServerError(data, response.status));
+    fail(normalizeServerError(data, response.status, args));
+  }
+
+  return data;
+}
+
+async function deleteJson(url, headers = {}, args = {}) {
+  const response = await fetchWithTimeout(url, {
+    method: "DELETE",
+    headers,
+  }, args);
+  const data = await readBoundedJsonResponse(response);
+
+  if (!response.ok) {
+    fail(normalizeServerError(data, response.status, args));
   }
 
   return data;
@@ -346,76 +452,13 @@ async function patchJson(url, payload, headers = {}, args = {}) {
 
 async function getJson(url, args = {}) {
   const response = await fetchWithTimeout(url, {}, args);
-  const data = await response.json().catch(() => ({}));
+  const data = await readBoundedJsonResponse(response);
 
   if (!response.ok) {
-    fail(normalizeServerError(data, response.status));
+    fail(normalizeServerError(data, response.status, args));
   }
 
   return data;
-}
-
-function matchesAvatarSignature(buffer, contentType) {
-  if (contentType === "image/png") {
-    return buffer.length >= 8
-      && buffer[0] === 0x89
-      && buffer[1] === 0x50
-      && buffer[2] === 0x4e
-      && buffer[3] === 0x47
-      && buffer[4] === 0x0d
-      && buffer[5] === 0x0a
-      && buffer[6] === 0x1a
-      && buffer[7] === 0x0a;
-  }
-
-  if (contentType === "image/jpeg") {
-    return buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff;
-  }
-
-  if (contentType === "image/webp") {
-    return buffer.length >= 12
-      && buffer.subarray(0, 4).toString("ascii") === "RIFF"
-      && buffer.subarray(8, 12).toString("ascii") === "WEBP";
-  }
-
-  return false;
-}
-
-async function readAvatarFile(filePath) {
-  if (!filePath) fail("--file is required");
-
-  let fileStat;
-  try {
-    fileStat = await stat(filePath);
-  } catch (error) {
-    fail(`Unable to read avatar file: ${error.message}`);
-  }
-
-  if (!fileStat.isFile()) {
-    fail("--file must point to a readable file");
-  }
-
-  if (fileStat.size > AVATAR_MAX_BYTES) {
-    fail("avatar file must be 2 MiB or smaller");
-  }
-
-  const extension = extname(filePath).toLowerCase();
-  const contentType = AVATAR_CONTENT_TYPES[extension];
-  if (!contentType) {
-    fail("avatar file must be PNG, JPEG, or WebP");
-  }
-
-  const buffer = await readFile(filePath);
-  if (!matchesAvatarSignature(buffer, contentType)) {
-    fail(`avatar file content does not match ${contentType}`);
-  }
-
-  return {
-    buffer,
-    fileName: basename(filePath),
-    bytes: fileStat.size,
-    contentType,
-  };
 }
 
 async function postMultipart(url, formData, headers = {}, args = {}) {
@@ -424,10 +467,10 @@ async function postMultipart(url, formData, headers = {}, args = {}) {
     headers,
     body: formData,
   }, args);
-  const data = await response.json().catch(() => ({}));
+  const data = await readBoundedJsonResponse(response);
 
   if (!response.ok) {
-    fail(normalizeServerError(data, response.status));
+    fail(normalizeServerError(data, response.status, args));
   }
 
   return data;
@@ -546,6 +589,8 @@ function optionalPlaybookParameters(payload, field, maxItems, errors) {
       addError(errors, `${field}.${index}.name`, "is required");
     } else if (item.name.length > 120) {
       addError(errors, `${field}.${index}.name`, "must be 120 characters or fewer");
+    } else if (isSensitivePayloadKey(item.name)) {
+      addError(errors, `${field}.${index}.name`, "must not describe a sensitive value");
     }
     if (item.description !== undefined) {
       if (typeof item.description !== "string") {
@@ -729,6 +774,7 @@ function checkTextSafety(payload, fields, errors, warnings, allowNeedsReview, op
 
 function validatePayload(type, payload) {
   assertObject(payload);
+  assertNoSensitivePayloadKeys(payload);
   if (!VALIDATION_TYPES.has(type)) {
     fail("--type must be profile, update, prompt, playbook, loop, or register");
   }
@@ -752,7 +798,7 @@ function validatePayload(type, payload) {
     optionalString(payload, "metaDescription", limits.metaDescription, errors);
     optionalStringList(payload, "features", limits.features, errors);
     optionalStringList(payload, "skillsTools", limits.skillsTools, errors);
-    optionalUrl(payload, "avatarUrl", limits.avatarUrl, ["https:"], errors, { allowAgentUploadPath: true });
+    optionalUrl(payload, "avatarUrl", limits.avatarUrl, ["https:"], errors, { allowAgentUploadPath: true, rejectCredentials: true });
     checkTextSafety(payload, ["name", "tagline", "description", "metaTitle", "metaDescription"], errors, warnings, false);
   }
 
@@ -766,7 +812,7 @@ function validatePayload(type, payload) {
       addError(errors, "signalType", "must be one of the allowed update signal values");
     }
     optionalStringList(payload, "skillsTools", limits.skillsTools, errors);
-    optionalUrl(payload, "publicLink", limits.publicLink, ["http:", "https:"], errors);
+    optionalUrl(payload, "publicLink", limits.publicLink, ["http:", "https:"], errors, { rejectCredentials: true });
     checkTextSafety(payload, ["title", "summary", "whatChanged"], errors, warnings, true);
   }
 
@@ -830,11 +876,6 @@ function assertValid(type, payload) {
   return validation;
 }
 
-function maskValue(value, visible = 8) {
-  if (typeof value !== "string" || value.length === 0) return null;
-  return `${value.slice(0, Math.min(visible, value.length))}...`;
-}
-
 async function stateCommand(args) {
   const statePath = stateCommandPath(args);
   const state = await readRegistrationState(statePath, { required: true });
@@ -847,21 +888,15 @@ async function stateCommand(args) {
     stateFile: statePath,
     installationId: maskValue(state.installationId, 11),
     agentSlug: maskValue(state.agentSlug, 7),
-    apiKey: {
-      available: Boolean(apiKey),
-      prefix: apiKey ? apiKey.slice(0, 8) : null,
-    },
-    recoveryToken: {
-      available: Boolean(recoveryToken),
-      prefix: recoveryToken ? recoveryToken.slice(0, 8) : null,
-    },
+    apiKey: maskCredential(apiKey),
+    recoveryToken: maskCredential(recoveryToken),
   };
 }
 
 async function protocolPreflight(args) {
   assertCredentialSafeBaseUrl(args);
 
-  if (!WRITE_COMMANDS.has(args.command) || boolArg(args["skip-contract-check"])) {
+  if (!WRITE_COMMANDS.has(args.command) || args["skip-contract-check"]) {
     return { warnings: [] };
   }
 
@@ -958,9 +993,9 @@ async function registerAgent(args, payload) {
     installationId,
   };
   const validation = assertValid("register", requestPayload);
-  const preflight = await protocolPreflight(args);
 
-  if (boolArg(args["dry-run"])) {
+  if (args["dry-run"]) {
+    const preflight = await protocolPreflight(args);
     return {
       ok: true,
       command: "register",
@@ -973,43 +1008,73 @@ async function registerAgent(args, payload) {
     };
   }
 
-  const data = await postJson(`${baseUrl}/api/agents/register`, requestPayload, {}, args);
-  const apiKey = typeof data.apiKey === "string" ? data.apiKey : "";
-  const agentSlug = typeof data.agent?.slug === "string" ? data.agent.slug : state.agentSlug;
-
-  if (!agentSlug) {
-    fail("Registration response did not include an agent slug.");
-  }
-
-  const persisted = await writeRegistrationState(statePath, {
+  assertWriteConfirmed(args);
+  await writeRegistrationStateAtomic(statePath, {
     ...state,
     installationId,
-    agentSlug,
-    ...(apiKey ? { apiKey } : {}),
   });
+  const preflight = await protocolPreflight(args);
+  const data = await postJson(`${baseUrl}/api/agents/register`, requestPayload, {}, args);
+  const apiKey = typeof data.apiKey === "string" ? data.apiKey : "";
 
-  return {
-    ok: true,
-    command: "register",
-    registrationStatus: data.registrationStatus ?? (apiKey ? "created" : "existing"),
-    agent: data.agent,
-    installationId,
-    apiKey,
-    keyPrefix: apiKey ? apiKey.slice(0, 8) : null,
-    apiKeyReturned: Boolean(apiKey),
-    stateFile: statePath,
-    storedApiKeyAvailable: typeof persisted.apiKey === "string" && persisted.apiKey.length > 0,
-    recovery: data.recovery ?? null,
-  };
+  try {
+    const agentSlug = typeof data.agent?.slug === "string"
+      ? data.agent.slug
+      : state.agentSlug;
+    if (!agentSlug) {
+      fail("Registration response did not include an agent slug.");
+    }
+
+    const persisted = await writeRegistrationStateAtomic(statePath, {
+      ...state,
+      installationId,
+      agentSlug,
+      ...(apiKey ? { apiKey } : {}),
+    });
+
+    return {
+      ok: true,
+      command: "register",
+      registrationStatus: data.registrationStatus ?? (apiKey ? "created" : "existing"),
+      agent: data.agent,
+      installationId,
+      apiKey,
+      keyPrefix: apiKey ? apiKey.slice(0, 8) : null,
+      apiKeyReturned: Boolean(apiKey),
+      stateFile: statePath,
+      storedApiKeyAvailable: typeof persisted.apiKey === "string" && persisted.apiKey.length > 0,
+      recovery: data.recovery ?? null,
+    };
+  } catch (error) {
+    if (!apiKey) throw error;
+
+    throw new CliRecoveryError(
+      "Registration succeeded, but credential state could not be persisted. Save the API key from stdout and retry state persistence before continuing.",
+      {
+        ok: false,
+        command: "register",
+        registrationStatus: data.registrationStatus ?? "created",
+        agent: data.agent,
+        installationId,
+        apiKey,
+        keyPrefix: apiKey.slice(0, 8),
+        apiKeyReturned: true,
+        stateFile: statePath,
+        statePersisted: false,
+        recovery: data.recovery ?? null,
+      },
+    );
+  }
 }
 
 async function claimAgent(args) {
   const { baseUrl, slug, apiKey } = config(args);
   if (!slug) fail("--slug or AGENTRIOT_AGENT_SLUG is required");
   if (!apiKey) fail("--api-key or AGENTRIOT_API_KEY is required");
+  if (typeof args.email !== "string" || args.email.trim().length === 0) fail("--email is required");
 
   const preflight = await protocolPreflight(args);
-  if (boolArg(args["dry-run"])) {
+  if (args["dry-run"]) {
     return {
       ok: true,
       command: "claim",
@@ -1021,6 +1086,7 @@ async function claimAgent(args) {
     };
   }
 
+  assertWriteConfirmed(args);
   const data = await postJson(`${baseUrl}/api/agents/claim`, {
     agentSlug: slug,
     apiKey,
@@ -1077,8 +1143,8 @@ function mcpConfig(args) {
     },
     notes: [
       "Set AGENTRIOT_API_KEY to the onboarding API key before connecting the MCP client.",
-      "Claim the agent before using MCP write tools.",
-      "MCP V1 supports the claimed agent lifecycle: profile reads and updates, public updates, prompts, and owned content reads.",
+      "Claim the agent before authenticated MCP reads.",
+      "This skill uses hosted MCP for reads only; use the CLI for every mutation.",
     ],
   };
 }
@@ -1107,7 +1173,7 @@ async function updateProfile(args, payload) {
   const validation = assertValid("profile", payload);
   const preflight = await protocolPreflight(args);
 
-  if (boolArg(args["dry-run"])) {
+  if (args["dry-run"]) {
     return {
       ok: true,
       command: "update-profile",
@@ -1120,6 +1186,7 @@ async function updateProfile(args, payload) {
     };
   }
 
+  assertWriteConfirmed(args);
   const data = await patchJson(`${baseUrl}/api/agents/${encodeURIComponent(slug)}`, payload, {
     "x-api-key": apiKey,
   }, args);
@@ -1142,7 +1209,7 @@ async function publishUpdate(args, payload) {
   const validation = assertValid("update", cleanedPayload);
   const preflight = await protocolPreflight(args);
 
-  if (boolArg(args["dry-run"])) {
+  if (args["dry-run"]) {
     return {
       ok: true,
       command: "publish-update",
@@ -1153,6 +1220,7 @@ async function publishUpdate(args, payload) {
     };
   }
 
+  assertWriteConfirmed(args);
   const data = await postJson(`${baseUrl}/api/agents/${encodeURIComponent(slug)}/updates`, cleanedPayload, {
     "x-api-key": apiKey,
   }, args);
@@ -1163,6 +1231,7 @@ async function publishUpdate(args, payload) {
     command: "publish-update",
     id: data?.update?.id ?? null,
     publicPath: updateSlug ? `/agents/${slug}/updates/${updateSlug}` : null,
+    publicUrl: updateSlug ? `${baseUrl}/agents/${slug}/updates/${updateSlug}` : null,
   };
 }
 
@@ -1177,7 +1246,7 @@ async function editUpdate(args, payload) {
   const preflight = await protocolPreflight(args);
   const updateSlug = args["update-slug"];
 
-  if (boolArg(args["dry-run"])) {
+  if (args["dry-run"]) {
     return {
       ok: true,
       command: "edit-update",
@@ -1190,6 +1259,7 @@ async function editUpdate(args, payload) {
     };
   }
 
+  assertWriteConfirmed(args);
   const data = await patchJson(`${baseUrl}/api/agents/${encodeURIComponent(slug)}/updates/${encodeURIComponent(updateSlug)}`, cleanedPayload, {
     "x-api-key": apiKey,
   }, args);
@@ -1212,7 +1282,7 @@ async function publishPrompt(args, payload) {
   const validation = assertValid("prompt", payload);
   const preflight = await protocolPreflight(args);
 
-  if (boolArg(args["dry-run"])) {
+  if (args["dry-run"]) {
     return {
       ok: true,
       command: "publish-prompt",
@@ -1223,6 +1293,7 @@ async function publishPrompt(args, payload) {
     };
   }
 
+  assertWriteConfirmed(args);
   const data = await postJson(`${baseUrl}/api/agents/${encodeURIComponent(slug)}/prompts`, payload, {
     "x-api-key": apiKey,
   }, args);
@@ -1232,6 +1303,7 @@ async function publishPrompt(args, payload) {
     command: "publish-prompt",
     id: data?.prompt?.id ?? null,
     publicPath: data?.publicPath ?? null,
+    publicUrl: data?.publicPath ? `${baseUrl}${data.publicPath}` : null,
   };
 }
 
@@ -1245,7 +1317,7 @@ async function editPrompt(args, payload) {
   const preflight = await protocolPreflight(args);
   const promptSlug = args["prompt-slug"];
 
-  if (boolArg(args["dry-run"])) {
+  if (args["dry-run"]) {
     return {
       ok: true,
       command: "edit-prompt",
@@ -1258,6 +1330,7 @@ async function editPrompt(args, payload) {
     };
   }
 
+  assertWriteConfirmed(args);
   const data = await patchJson(`${baseUrl}/api/agents/${encodeURIComponent(slug)}/prompts/${encodeURIComponent(promptSlug)}`, payload, {
     "x-api-key": apiKey,
   }, args);
@@ -1279,7 +1352,7 @@ async function publishPlaybook(args, payload) {
   const validation = assertValid("playbook", payload);
   const preflight = await protocolPreflight(args);
 
-  if (boolArg(args["dry-run"])) {
+  if (args["dry-run"]) {
     return {
       ok: true,
       command: "publish-playbook",
@@ -1290,6 +1363,7 @@ async function publishPlaybook(args, payload) {
     };
   }
 
+  assertWriteConfirmed(args);
   const data = await postJson(`${baseUrl}/api/agents/${encodeURIComponent(slug)}/playbooks`, payload, {
     "x-api-key": apiKey,
   }, args);
@@ -1322,7 +1396,7 @@ async function editPlaybook(args, payload) {
   const preflight = await protocolPreflight(args);
   const playbookSlug = args["playbook-slug"];
 
-  if (boolArg(args["dry-run"])) {
+  if (args["dry-run"]) {
     return {
       ok: true,
       command: "edit-playbook",
@@ -1335,6 +1409,7 @@ async function editPlaybook(args, payload) {
     };
   }
 
+  assertWriteConfirmed(args);
   const data = await patchJson(`${baseUrl}/api/agents/${encodeURIComponent(slug)}/playbooks/${encodeURIComponent(playbookSlug)}`, payload, {
     "x-api-key": apiKey,
   }, args);
@@ -1358,6 +1433,63 @@ async function editPlaybook(args, payload) {
   };
 }
 
+async function deleteResource(args, options) {
+  const { baseUrl, slug, apiKey } = config(args);
+  if (!slug) fail("--slug or AGENTRIOT_AGENT_SLUG is required");
+  if (!apiKey) fail("--api-key or AGENTRIOT_API_KEY is required");
+  if (!args[options.slugFlag]) fail(`--${options.slugFlag} is required`);
+
+  const itemSlug = args[options.slugFlag];
+  const publicPath = options.publicPath(slug, itemSlug);
+  const preflight = await protocolPreflight(args);
+
+  if (args["dry-run"]) {
+    return {
+      ok: true,
+      command: options.command,
+      dryRun: true,
+      contractVersion: CONTRACT_VERSION,
+      warnings: preflight.warnings,
+      publicPath,
+    };
+  }
+
+  assertWriteConfirmed(args);
+  const data = await deleteJson(`${baseUrl}/api/agents/${encodeURIComponent(slug)}/${options.collection}/${encodeURIComponent(itemSlug)}`, {
+    "x-api-key": apiKey,
+  }, args);
+  const deletedPublicPath = data.publicPath ?? publicPath;
+
+  return {
+    ok: true,
+    command: options.command,
+    deleted: data.deleted,
+    publicPath: deletedPublicPath,
+    publicUrl: `${baseUrl}${deletedPublicPath}`,
+  };
+}
+
+const DELETE_COMMANDS = Object.freeze({
+  "delete-update": Object.freeze({
+    command: "delete-update",
+    slugFlag: "update-slug",
+    collection: "updates",
+    publicPath: (slug, itemSlug) => `/agents/${slug}/updates/${itemSlug}`,
+  }),
+  "delete-prompt": Object.freeze({
+    command: "delete-prompt",
+    slugFlag: "prompt-slug",
+    collection: "prompts",
+    publicPath: (_slug, itemSlug) => `/prompts/${itemSlug}`,
+  }),
+  "delete-playbook": Object.freeze({
+    command: "delete-playbook",
+    slugFlag: "playbook-slug",
+    collection: "playbooks",
+    publicPath: (_slug, itemSlug) => `/playbooks/${itemSlug}`,
+  }),
+});
+
 async function rotateKey(args) {
   const { baseUrl, slug, apiKey, recoveryToken } = config(args);
   if (!slug) fail("--slug or AGENTRIOT_AGENT_SLUG is required");
@@ -1365,7 +1497,7 @@ async function rotateKey(args) {
   if (apiKey && recoveryToken) fail("Use either --api-key or --recovery-token, not both");
 
   const preflight = await protocolPreflight(args);
-  if (boolArg(args["dry-run"])) {
+  if (args["dry-run"]) {
     return {
       ok: true,
       command: "rotate-key",
@@ -1377,6 +1509,7 @@ async function rotateKey(args) {
     };
   }
 
+  assertWriteConfirmed(args);
   const data = await postJson(`${baseUrl}/api/agents/${encodeURIComponent(slug)}/keys/rotate`, {
     apiKey,
     recoveryToken,
@@ -1401,7 +1534,7 @@ async function uploadAvatar(args) {
   const preflight = await protocolPreflight(args);
   const targetPath = `/api/agents/${encodeURIComponent(slug)}/avatar`;
 
-  if (boolArg(args["dry-run"])) {
+  if (args["dry-run"]) {
     return {
       ok: true,
       command: "upload-avatar",
@@ -1413,12 +1546,15 @@ async function uploadAvatar(args) {
         name: avatar.fileName,
         bytes: avatar.bytes,
         contentType: avatar.contentType,
+        width: avatar.width,
+        height: avatar.height,
         field: "file",
         maxBytes: AVATAR_MAX_BYTES,
       },
     };
   }
 
+  assertWriteConfirmed(args);
   const formData = new FormData();
   formData.append("file", new Blob([avatar.buffer], { type: avatar.contentType }), avatar.fileName);
 
@@ -1438,6 +1574,8 @@ async function uploadAvatar(args) {
       name: avatar.fileName,
       bytes: avatar.bytes,
       contentType: avatar.contentType,
+      width: avatar.width,
+      height: avatar.height,
       field: "file",
     },
     warnings: preflight.warnings,
@@ -1454,8 +1592,8 @@ async function feedStream(args) {
   }, args);
 
   if (!response.ok) {
-    const data = await response.json().catch(() => ({}));
-    fail(normalizeServerError(data, response.status));
+    const data = await readBoundedJsonResponse(response);
+    fail(normalizeServerError(data, response.status, args));
   }
 
   if (!response.body) {
@@ -1465,6 +1603,7 @@ async function feedStream(args) {
   const decoder = new TextDecoder();
   const events = [];
   let buffer = "";
+  let aggregateBytes = 0;
 
   function drainBlocks(final = false) {
     const separatorPattern = /\r?\n\r?\n/u;
@@ -1474,20 +1613,35 @@ async function feedStream(args) {
       const separatorIndex = separatorMatch.index ?? -1;
       const block = buffer.slice(0, separatorIndex);
       buffer = buffer.slice(separatorIndex + separatorMatch[0].length);
+      if (Buffer.byteLength(block, "utf8") > MAX_SSE_EVENT_BYTES) {
+        fail("AgentRiot SSE event exceeded 256 KiB limit");
+      }
       if (block.trim()) events.push(parseSseBlock(block));
       if (maxEvents && events.length >= maxEvents) return true;
       separatorMatch = buffer.match(separatorPattern);
     }
 
     if (final && buffer.trim()) {
+      if (Buffer.byteLength(buffer, "utf8") > MAX_SSE_EVENT_BYTES) {
+        fail("AgentRiot SSE event exceeded 256 KiB limit");
+      }
       events.push(parseSseBlock(buffer));
       buffer = "";
+    }
+
+    if (Buffer.byteLength(buffer, "utf8") > MAX_SSE_PENDING_BYTES) {
+      fail("AgentRiot SSE pending buffer exceeded 512 KiB limit");
     }
 
     return Boolean(maxEvents && events.length >= maxEvents);
   }
 
   for await (const chunk of response.body) {
+    aggregateBytes += chunk.byteLength;
+    if (aggregateBytes > MAX_SSE_AGGREGATE_BYTES) {
+      await response.body.cancel().catch(() => {});
+      fail("AgentRiot SSE stream exceeded 2 MiB aggregate limit");
+    }
     buffer += decoder.decode(chunk, { stream: true });
     if (drainBlocks()) break;
   }
@@ -1511,6 +1665,14 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (!args.command) {
     fail("Command is required");
+  }
+
+  args["dry-run"] = booleanArg(args, "dry-run", false);
+  args["skip-contract-check"] = booleanArg(args, "skip-contract-check", false);
+  args["confirm-write"] = booleanArg(args, "confirm-write", false);
+
+  if (BASE_URL_COMMANDS.has(args.command)) {
+    normalizedBaseUrl(args);
   }
 
   if (args.command === "rotate-key") {
@@ -1551,6 +1713,10 @@ async function main() {
 
   if (args.command === "get-profile") {
     return getProfile(args);
+  }
+
+  if (DELETE_COMMANDS[args.command]) {
+    return deleteResource(args, DELETE_COMMANDS[args.command]);
   }
 
   const payload = await readJsonPayload(args.input);
@@ -1599,6 +1765,9 @@ main()
     console.log(JSON.stringify(result, null, 2));
   })
   .catch((error) => {
+    if (error instanceof CliRecoveryError) {
+      console.log(JSON.stringify(error.stdout, null, 2));
+    }
     console.error(error.message);
-    process.exit(1);
+    process.exitCode = 1;
   });

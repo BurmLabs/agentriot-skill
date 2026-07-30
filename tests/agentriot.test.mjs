@@ -1,11 +1,13 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { chmod, mkdtemp, readFile, readdir, rename, stat, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { assertWriteConfirmed } from "../bin/lib/args.mjs";
 
 const execFileAsync = promisify(execFile);
 const scriptPath = new URL("../bin/agentriot.mjs", import.meta.url);
@@ -43,9 +45,15 @@ async function runCli(args) {
   return JSON.parse(stdout);
 }
 
-async function runCliFailure(args) {
+async function runCliFailure(args, options = {}) {
   try {
-    await execFileAsync("node", [scriptPath.pathname, ...args]);
+    await execFileAsync("node", [scriptPath.pathname, ...args], {
+      ...options,
+      env: {
+        ...process.env,
+        ...options.env,
+      },
+    });
   } catch (error) {
     return {
       code: error.code,
@@ -57,11 +65,72 @@ async function runCliFailure(args) {
   assert.fail("CLI command unexpectedly succeeded");
 }
 
-function tinyPng() {
-  return Buffer.from(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
-    "base64",
-  );
+function pngFixture(width, height) {
+  const buffer = Buffer.alloc(33);
+  Buffer.from("89504e470d0a1a0a", "hex").copy(buffer);
+  buffer.writeUInt32BE(13, 8);
+  buffer.write("IHDR", 12, "ascii");
+  buffer.writeUInt32BE(width, 16);
+  buffer.writeUInt32BE(height, 20);
+  return buffer;
+}
+
+function jpegFixture(width, height) {
+  const startOfFrame = Buffer.from([
+    0xff, 0xc0, 0x00, 0x0b, 0x08,
+    0x00, 0x00,
+    0x00, 0x00,
+    0x01,
+    0x01, 0x11, 0x00,
+  ]);
+  startOfFrame.writeUInt16BE(height, 5);
+  startOfFrame.writeUInt16BE(width, 7);
+  return Buffer.concat([
+    Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x04, 0x00, 0x00]),
+    startOfFrame,
+  ]);
+}
+
+function webpRiff(chunkType, chunkData) {
+  const buffer = Buffer.alloc(20 + chunkData.length + (chunkData.length % 2));
+  buffer.write("RIFF", 0, "ascii");
+  buffer.writeUInt32LE(buffer.length - 8, 4);
+  buffer.write("WEBP", 8, "ascii");
+  buffer.write(chunkType, 12, "ascii");
+  buffer.writeUInt32LE(chunkData.length, 16);
+  chunkData.copy(buffer, 20);
+  return buffer;
+}
+
+function webpVp8xFixture(width, height, options = {}) {
+  const chunkData = Buffer.alloc(10);
+  chunkData[0] = options.flags ?? 0;
+  Buffer.from(options.reservedBytes ?? [0, 0, 0]).copy(chunkData, 1);
+  chunkData.writeUIntLE(width - 1, 4, 3);
+  chunkData.writeUIntLE(height - 1, 7, 3);
+  return webpRiff("VP8X", chunkData);
+}
+
+function webpVp8Fixture(width, height, options = {}) {
+  const chunkData = Buffer.from([
+    options.frameTag ?? 0x00, 0x00, 0x00,
+    0x9d, 0x01, 0x2a,
+    0x00, 0x00,
+    0x00, 0x00,
+  ]);
+  chunkData.writeUInt16LE(width, 6);
+  chunkData.writeUInt16LE(height, 8);
+  return webpRiff("VP8 ", chunkData);
+}
+
+function webpVp8lFixture(width, height, options = {}) {
+  const chunkData = Buffer.alloc(5);
+  chunkData[0] = 0x2f;
+  const dimensions = BigInt(width - 1)
+    | (BigInt(height - 1) << 14n)
+    | (BigInt(options.version ?? 0) << 29n);
+  chunkData.writeUInt32LE(Number(dimensions), 1);
+  return webpRiff("VP8L", chunkData);
 }
 
 function validPlaybookPayload(overrides = {}) {
@@ -167,7 +236,7 @@ test("check-updates compares local skill version to protocol metadata", async ()
     assert.equal(result.command, "check-updates");
     assert.equal(result.upToDate, true);
     assert.equal(result.meetsMinimum, true);
-    assert.equal(result.localSkill.version, "0.10.1");
+    assert.equal(result.localSkill.version, "0.11.0");
   });
 });
 
@@ -228,12 +297,170 @@ test("CLI defaults to AgentRiot production for static commands", async () => {
   assert.equal(result.publicUrl, "https://agentriot.com/agents/my-research-agent");
 });
 
-test("write commands do not contain a production confirmation guard", async () => {
-  const source = await readFile(scriptPath, "utf8");
+test("dry-run rejects invalid boolean values before network access", async () => {
+  let requests = 0;
 
-  assert.equal(source.includes("confirm-production"), false);
-  assert.equal(source.includes("assertProductionWriteAllowed"), false);
-  assert.equal(source.includes("isProductionBaseUrl"), false);
+  await withServer((_request, response) => {
+    requests += 1;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify(protocolResponse()));
+  }, async (baseUrl) => {
+    const result = await runCliFailure([
+      "claim",
+      "--slug",
+      "lifecycle-agent",
+      "--api-key",
+      "agrt_secret_key",
+      "--email",
+      "owner@example.com",
+      "--base-url",
+      baseUrl,
+      "--dry-run",
+      "ture",
+    ]);
+
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /--dry-run must be true or false/u);
+    assert.equal(requests, 0);
+  });
+});
+
+test("write confirmation helper rejects raw false strings", () => {
+  assert.throws(
+    () => assertWriteConfirmed({ "confirm-write": "false" }),
+    /--confirm-write true is required for live writes/u,
+  );
+});
+
+test("skip-contract-check rejects malformed values before network access", async () => {
+  let requests = 0;
+
+  await withServer((_request, response) => {
+    requests += 1;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify(protocolResponse()));
+  }, async (baseUrl) => {
+    const result = await runCliFailure([
+      "claim",
+      "--slug",
+      "lifecycle-agent",
+      "--api-key",
+      "agrt_secret_key",
+      "--base-url",
+      baseUrl,
+      "--skip-contract-check",
+      "truthy",
+    ]);
+
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /--skip-contract-check must be true or false/u);
+    assert.equal(requests, 0);
+  });
+});
+
+test("confirm-write rejects malformed values before network access", async () => {
+  let requests = 0;
+
+  await withServer((_request, response) => {
+    requests += 1;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify(protocolResponse()));
+  }, async (baseUrl) => {
+    const result = await runCliFailure([
+      "claim",
+      "--slug",
+      "lifecycle-agent",
+      "--api-key",
+      "agrt_secret_key",
+      "--base-url",
+      baseUrl,
+      "--confirm-write",
+      "yes",
+    ]);
+
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /--confirm-write must be true or false/u);
+    assert.equal(requests, 0);
+  });
+});
+
+test("unknown flags fail closed", async () => {
+  const result = await runCliFailure([
+    "profile",
+    "--slug",
+    "lifecycle-agent",
+    "--unknown",
+    "value",
+  ]);
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /Unknown flag for profile: --unknown/u);
+});
+
+test("unknown no-input commands are rejected as unknown", async () => {
+  const result = await runCliFailure(["unknown-command"]);
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /Unknown command: unknown-command/u);
+  assert.doesNotMatch(result.stderr, /--input is required/u);
+});
+
+test("live claim requires explicit write confirmation before mutation", async () => {
+  let mutationRequests = 0;
+
+  await withServer((request, response) => {
+    if (request.url === "/api/agent-protocol") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(protocolResponse()));
+      return;
+    }
+
+    mutationRequests += 1;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ claimed: true, agentId: "agt_1" }));
+  }, async (baseUrl) => {
+    const result = await runCliFailure([
+      "claim",
+      "--slug",
+      "lifecycle-agent",
+      "--api-key",
+      "agrt_secret_key",
+      "--email",
+      "owner@example.com",
+      "--base-url",
+      baseUrl,
+    ]);
+
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /--confirm-write true is required for live writes/u);
+    assert.equal(mutationRequests, 0);
+  });
+});
+
+test("claim email is required before protocol preflight", async () => {
+  let requests = 0;
+
+  await withServer((_request, response) => {
+    requests += 1;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify(protocolResponse()));
+  }, async (baseUrl) => {
+    const result = await runCliFailure([
+      "claim",
+      "--slug",
+      "lifecycle-agent",
+      "--api-key",
+      "agrt_secret_key",
+      "--base-url",
+      baseUrl,
+      "--dry-run",
+      "true",
+    ]);
+
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /--email is required/u);
+    assert.equal(requests, 0);
+  });
 });
 
 test("lookup-software calls the AgentRiot software API", async () => {
@@ -265,15 +492,21 @@ test("register generates and persists a stable installation identity with return
   });
   const statePath = `${inputPath}.agentriot-state.json`;
   let seenBody = null;
+  let preflightRequests = 0;
+  let mutationRequests = 0;
 
   await withServer(async (request, response) => {
     if (request.url === "/api/agent-protocol") {
+      preflightRequests += 1;
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify(protocolResponse()));
       return;
     }
 
+    mutationRequests += 1;
+    assert.equal(request.method, "POST");
     assert.equal(request.url, "/api/agents/register");
+    assert.equal(request.headers["x-api-key"], undefined);
     const body = JSON.parse(await readRequestBody(request));
     seenBody = body;
 
@@ -284,21 +517,373 @@ test("register generates and persists a stable installation identity with return
       apiKey: "agrt_secret",
     }));
   }, async (baseUrl) => {
-    const result = await runCli(["register", "--input", inputPath, "--base-url", baseUrl]);
+    const result = await runCli(["register", "--input", inputPath, "--base-url", baseUrl, "--confirm-write", "true"]);
 
-    assert.equal(result.ok, true);
-    assert.equal(result.command, "register");
-    assert.equal(seenBody.name, "Lifecycle Agent");
     assert.equal(typeof seenBody.installationId, "string");
     assert.ok(seenBody.installationId.length > 20);
-    assert.equal(result.agent.slug, "lifecycle-agent");
-    assert.equal(result.keyPrefix, "agrt_sec");
-    assert.equal(result.registrationStatus, "created");
+    assert.deepEqual(seenBody, {
+      name: "Lifecycle Agent",
+      tagline: "Uses AgentRiot.",
+      description: "Exercises registration.",
+      installationId: seenBody.installationId,
+    });
+    assert.deepEqual(result, {
+      ok: true,
+      command: "register",
+      registrationStatus: "created",
+      agent: { id: "agt_1", slug: "lifecycle-agent", name: "Lifecycle Agent" },
+      installationId: seenBody.installationId,
+      apiKey: "agrt_secret",
+      keyPrefix: "agrt_sec",
+      apiKeyReturned: true,
+      stateFile: statePath,
+      storedApiKeyAvailable: true,
+      recovery: null,
+    });
+    assert.equal(preflightRequests, 1);
+    assert.equal(mutationRequests, 1);
 
     const state = await readJsonFile(statePath);
     assert.equal(state.installationId, result.installationId);
     assert.equal(state.agentSlug, "lifecycle-agent");
     assert.equal(state.apiKey, "agrt_secret");
+  });
+});
+
+test("state atomic writes reject symlink destinations", async () => {
+  const { writeRegistrationStateAtomic } = await import("../bin/lib/state.mjs");
+  const dir = await mkdtemp(join(tmpdir(), "agentriot-state-"));
+  const targetPath = join(dir, "target.json");
+  const statePath = join(dir, "state.json");
+  const original = '{"installationId":"install_target"}\n';
+  await writeFile(targetPath, original, "utf8");
+  await symlink(targetPath, statePath);
+
+  await assert.rejects(
+    writeRegistrationStateAtomic(statePath, {
+      installationId: "install_replacement",
+    }),
+    /symbolic link/u,
+  );
+
+  assert.equal(await readFile(targetPath, "utf8"), original);
+});
+
+test("state atomic writes replace permissive files with owner-only permissions", async () => {
+  const { writeRegistrationStateAtomic } = await import("../bin/lib/state.mjs");
+  const dir = await mkdtemp(join(tmpdir(), "agentriot-state-"));
+  const statePath = join(dir, "state.json");
+  await writeFile(statePath, '{"installationId":"install_old"}\n', {
+    encoding: "utf8",
+    mode: 0o644,
+  });
+
+  await writeRegistrationStateAtomic(statePath, {
+    installationId: "install_new",
+    agentSlug: "lifecycle-agent",
+  });
+
+  assert.equal((await stat(statePath)).mode & 0o777, 0o600);
+  assert.deepEqual(await readJsonFile(statePath), {
+    installationId: "install_new",
+    agentSlug: "lifecycle-agent",
+  });
+});
+
+test("state atomic writes chmod to exact 0600 under a restrictive umask", async () => {
+  const { writeRegistrationStateAtomic } = await import("../bin/lib/state.mjs");
+  const dir = await mkdtemp(join(tmpdir(), "agentriot-state-"));
+  const statePath = join(dir, "state.json");
+  const previousUmask = process.umask(0o777);
+
+  try {
+    await writeRegistrationStateAtomic(statePath, {
+      installationId: "install_restrictive_umask",
+    });
+  } finally {
+    process.umask(previousUmask);
+  }
+
+  assert.equal((await stat(statePath)).mode & 0o777, 0o600);
+});
+
+test("state atomic writes fsync the parent directory before success", async () => {
+  const { createRegistrationStateIO } = await import("../bin/lib/state.mjs");
+  const realFileSystem = await import("node:fs/promises");
+  const dir = await mkdtemp(join(tmpdir(), "agentriot-state-"));
+  const statePath = join(dir, "state.json");
+  let directorySyncs = 0;
+  const order = [];
+  const stateIO = createRegistrationStateIO({
+    rename: async (...args) => {
+      order.push("rename");
+      return rename(...args);
+    },
+    open: async (filePath, flags, mode) => {
+      if (filePath === dir) {
+        return {
+          async close() {},
+          async sync() {
+            order.push("directory-sync");
+            directorySyncs += 1;
+          },
+        };
+      }
+      if (filePath === statePath) order.push("final-open");
+      return realFileSystem.open(filePath, flags, mode);
+    },
+  });
+
+  await stateIO.writeRegistrationStateAtomic(statePath, {
+    installationId: "install_directory_sync",
+  });
+
+  assert.equal(directorySyncs, 1);
+  assert.deepEqual(order, ["rename", "directory-sync", "final-open"]);
+});
+
+test("state atomic writes fail closed when directory fsync is unsupported", async () => {
+  const { createRegistrationStateIO } = await import("../bin/lib/state.mjs");
+  const realFileSystem = await import("node:fs/promises");
+  const dir = await mkdtemp(join(tmpdir(), "agentriot-state-"));
+  const statePath = join(dir, "state.json");
+  const unsupported = Object.assign(new Error("directory sync unsupported"), {
+    code: "ENOTSUP",
+  });
+  const stateIO = createRegistrationStateIO({
+    open: async (filePath, flags, mode) => {
+      if (filePath === dir) throw unsupported;
+      return realFileSystem.open(filePath, flags, mode);
+    },
+  });
+
+  await assert.rejects(
+    stateIO.writeRegistrationStateAtomic(statePath, {
+      installationId: "install_directory_sync_required",
+    }),
+    /directory durability sync is required.*ENOTSUP/u,
+  );
+});
+
+test("state file opens use no-follow protection when the platform provides it", async () => {
+  const { createRegistrationStateIO } = await import("../bin/lib/state.mjs");
+  const realFileSystem = await import("node:fs/promises");
+  const dir = await mkdtemp(join(tmpdir(), "agentriot-state-"));
+  const statePath = join(dir, "state.json");
+  const openedStateFlags = [];
+  const stateIO = createRegistrationStateIO({
+    open: async (filePath, flags, mode) => {
+      if (filePath === statePath) openedStateFlags.push(flags);
+      return realFileSystem.open(filePath, flags, mode);
+    },
+  });
+
+  await stateIO.writeRegistrationStateAtomic(statePath, {
+    installationId: "install_no_follow",
+  });
+  await stateIO.readRegistrationState(statePath, { required: true });
+
+  if (fsConstants.O_NOFOLLOW) {
+    assert.ok(openedStateFlags.length >= 2);
+    for (const flags of openedStateFlags) {
+      assert.equal(flags & fsConstants.O_NOFOLLOW, fsConstants.O_NOFOLLOW);
+    }
+  }
+});
+
+test("state atomic post-temp failure removes temp and preserves prior state", async () => {
+  const { createRegistrationStateIO } = await import("../bin/lib/state.mjs");
+  const dir = await mkdtemp(join(tmpdir(), "agentriot-state-"));
+  const statePath = join(dir, "state.json");
+  const original = '{"installationId":"install_existing"}\n';
+  let renameCalls = 0;
+  await writeFile(statePath, original, { encoding: "utf8", mode: 0o600 });
+  const stateIO = createRegistrationStateIO({
+    rename: async () => {
+      renameCalls += 1;
+      throw Object.assign(new Error("injected rename failure"), { code: "EIO" });
+    },
+  });
+
+  await assert.rejects(
+    stateIO.writeRegistrationStateAtomic(statePath, {
+      installationId: "install_replacement",
+    }),
+    /injected rename failure/u,
+  );
+
+  assert.equal(renameCalls, 1);
+  assert.equal(await readFile(statePath, "utf8"), original);
+  assert.deepEqual(await readdir(dir), ["state.json"]);
+});
+
+test("state atomic write failure preserves the complete prior file", async () => {
+  const { writeRegistrationStateAtomic } = await import("../bin/lib/state.mjs");
+  const dir = await mkdtemp(join(tmpdir(), "agentriot-state-"));
+  const statePath = join(dir, "state.json");
+  const original = '{"installationId":"install_existing"}\n';
+  await writeFile(statePath, original, { encoding: "utf8", mode: 0o600 });
+  await chmod(dir, 0o500);
+
+  try {
+    await assert.rejects(
+      writeRegistrationStateAtomic(statePath, {
+        installationId: "install_replacement",
+      }),
+      /Unable to persist registration state/u,
+    );
+  } finally {
+    await chmod(dir, 0o700);
+  }
+
+  assert.equal(await readFile(statePath, "utf8"), original);
+  assert.deepEqual(await readdir(dir), ["state.json"]);
+});
+
+test("registration persistence stores installation identity before network access", async () => {
+  const inputPath = await writePayload("register.json", {
+    name: "Lifecycle Agent",
+    tagline: "Uses AgentRiot.",
+    description: "Exercises registration.",
+  });
+  const statePath = `${inputPath}.agentriot-state.json`;
+  let persistedBeforeFirstRequest = null;
+  let registrationInstallationId = null;
+
+  await withServer(async (request, response) => {
+    if (persistedBeforeFirstRequest === null) {
+      try {
+        persistedBeforeFirstRequest = await readJsonFile(statePath);
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+      }
+    }
+
+    if (request.url === "/api/agent-protocol") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(protocolResponse()));
+      return;
+    }
+
+    assert.equal(request.url, "/api/agents/register");
+    const body = JSON.parse(await readRequestBody(request));
+    registrationInstallationId = body.installationId;
+    response.writeHead(201, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      registrationStatus: "created",
+      agent: { id: "agt_1", slug: "lifecycle-agent", name: "Lifecycle Agent" },
+      apiKey: "agrt_one_time_key",
+    }));
+  }, async (baseUrl) => {
+    await runCli([
+      "register",
+      "--input",
+      inputPath,
+      "--base-url",
+      baseUrl,
+      "--confirm-write",
+      "true",
+    ]);
+  });
+
+  assert.equal(typeof persistedBeforeFirstRequest.installationId, "string");
+  assert.ok(persistedBeforeFirstRequest.installationId.length > 20);
+  assert.equal(registrationInstallationId, persistedBeforeFirstRequest.installationId);
+});
+
+test("registration persistence failure returns the one-time key only in recovery stdout", async () => {
+  const inputPath = await writePayload("register.json", {
+    name: "Lifecycle Agent",
+    tagline: "Uses AgentRiot.",
+    description: "Exercises registration.",
+  });
+  const statePath = `${inputPath}.agentriot-state.json`;
+  const symlinkTarget = join(tmpdir(), `agentriot-recovery-${Date.now()}.json`);
+  const oneTimeKey = "agrt_one_time_recovery_key";
+
+  await withServer(async (request, response) => {
+    if (request.url === "/api/agent-protocol") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(protocolResponse()));
+      return;
+    }
+
+    assert.equal(request.url, "/api/agents/register");
+    await writeFile(symlinkTarget, '{"untouched":true}\n', "utf8");
+    await symlink(symlinkTarget, `${statePath}.replacement`);
+    await rename(`${statePath}.replacement`, statePath);
+    response.writeHead(201, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      registrationStatus: "created",
+      agent: { id: "agt_1", slug: "lifecycle-agent", name: "Lifecycle Agent" },
+      apiKey: oneTimeKey,
+    }));
+  }, async (baseUrl) => {
+    const failure = await runCliFailure([
+      "register",
+      "--input",
+      inputPath,
+      "--base-url",
+      baseUrl,
+      "--confirm-write",
+      "true",
+    ]);
+    const recovery = JSON.parse(failure.stdout);
+
+    assert.equal(failure.code, 1);
+    assert.equal(recovery.ok, false);
+    assert.equal(recovery.command, "register");
+    assert.equal(recovery.statePersisted, false);
+    assert.equal(recovery.apiKey, oneTimeKey);
+    assert.equal(recovery.stateFile, statePath);
+    assert.match(failure.stderr, /Registration succeeded, but credential state could not be persisted/u);
+    assert.equal(failure.stderr.includes(oneTimeKey), false);
+  });
+
+  assert.deepEqual(await readJsonFile(symlinkTarget), { untouched: true });
+});
+
+test("registration response shape failure recovers a returned one-time key on stdout", async () => {
+  const inputPath = await writePayload("register.json", {
+    name: "Lifecycle Agent",
+    tagline: "Uses AgentRiot.",
+    description: "Exercises registration.",
+  });
+  const statePath = `${inputPath}.agentriot-state.json`;
+  const oneTimeKey = "agrt_missing_slug_recovery_key";
+
+  await withServer((request, response) => {
+    if (request.url === "/api/agent-protocol") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(protocolResponse()));
+      return;
+    }
+
+    assert.equal(request.url, "/api/agents/register");
+    response.writeHead(201, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      registrationStatus: "created",
+      agent: { id: "agt_1", name: "Lifecycle Agent" },
+      apiKey: oneTimeKey,
+    }));
+  }, async (baseUrl) => {
+    const failure = await runCliFailure([
+      "register",
+      "--input",
+      inputPath,
+      "--base-url",
+      baseUrl,
+      "--confirm-write",
+      "true",
+    ]);
+    const recovery = JSON.parse(failure.stdout);
+
+    assert.equal(failure.code, 1);
+    assert.equal(recovery.statePersisted, false);
+    assert.equal(recovery.apiKey, oneTimeKey);
+    assert.equal(recovery.stateFile, statePath);
+    assert.equal(failure.stderr.includes(oneTimeKey), false);
+    assert.match(failure.stderr, /Registration succeeded, but credential state could not be persisted/u);
   });
 });
 
@@ -328,7 +913,7 @@ test("register writes credential state with owner-only permissions", async () =>
         apiKey: "agrt_secret",
       }));
     }, async (baseUrl) => {
-      await runCli(["register", "--input", inputPath, "--base-url", baseUrl]);
+      await runCli(["register", "--input", inputPath, "--base-url", baseUrl, "--confirm-write", "true"]);
 
       const mode = (await stat(statePath)).mode & 0o777;
       assert.equal(mode, 0o600);
@@ -370,7 +955,7 @@ test("register reuses the persisted installation identity on repeat registration
       apiKey: null,
     }));
   }, async (baseUrl) => {
-    const result = await runCli(["register", "--input", inputPath, "--base-url", baseUrl]);
+    const result = await runCli(["register", "--input", inputPath, "--base-url", baseUrl, "--confirm-write", "true"]);
 
     assert.equal(result.ok, true);
     assert.equal(result.command, "register");
@@ -516,6 +1101,40 @@ test("validate rejects blocked update links locally", async () => {
   const invalid = await runCliFailure(["validate", "--type", "update", "--input", invalidPath]);
   assert.equal(invalid.code, 1);
   assert.match(invalid.stderr, /publicLink must use http or https URL protocol/u);
+});
+
+test("validate rejects embedded credentials in avatarUrl", async () => {
+  const inputPath = await writePayload("profile.json", {
+    avatarUrl: "https://user:pass@example.com/avatar.png",
+  });
+
+  const invalid = await runCliFailure(["validate", "--type", "profile", "--input", inputPath]);
+  assert.equal(invalid.code, 1);
+  assert.match(invalid.stderr, /avatarUrl must not include embedded credentials/u);
+});
+
+test("validate rejects embedded credentials in publicLink", async () => {
+  const inputPath = await writePayload("update.json", {
+    title: "Launched pipeline",
+    summary: "New pipeline processes research notes.",
+    whatChanged: "Published a public update.",
+    signalType: "status",
+    publicLink: "https://user:pass@example.com/launch",
+  });
+
+  const invalid = await runCliFailure(["validate", "--type", "update", "--input", inputPath]);
+  assert.equal(invalid.code, 1);
+  assert.match(invalid.stderr, /publicLink must not include embedded credentials/u);
+});
+
+test("validate rejects embedded credentials in sourceUrl", async () => {
+  const inputPath = await writePayload("playbook.json", validPlaybookPayload({
+    sourceUrl: "https://user:pass@example.com/playbook",
+  }));
+
+  const invalid = await runCliFailure(["validate", "--type", "playbook", "--input", inputPath]);
+  assert.equal(invalid.code, 1);
+  assert.match(invalid.stderr, /sourceUrl must not include embedded credentials/u);
 });
 
 test("validate accepts safe prompt code fences with literal script tags", async () => {
@@ -717,6 +1336,8 @@ test("write command protocol preflight rejects incompatible contracts before mut
       "agrt_secret_key",
       "--base-url",
       baseUrl,
+      "--confirm-write",
+      "true",
     ]);
 
     assert.equal(result.code, 1);
@@ -726,7 +1347,7 @@ test("write command protocol preflight rejects incompatible contracts before mut
 });
 
 test("upload-avatar dry-run validates file metadata and preflights without upload", async () => {
-  const avatarPath = await writeTempFile("avatar.png", tinyPng());
+  const avatarPath = await writeTempFile("avatar.png", pngFixture(128, 128));
   let requests = 0;
 
   await withServer((request, response) => {
@@ -756,6 +1377,8 @@ test("upload-avatar dry-run validates file metadata and preflights without uploa
     assert.equal(result.targetPath, "/api/agents/lifecycle-agent/avatar");
     assert.equal(result.file.field, "file");
     assert.equal(result.file.contentType, "image/png");
+    assert.equal(result.file.width, 128);
+    assert.equal(result.file.height, 128);
     assert.equal(result.file.maxBytes, 2 * 1024 * 1024);
     assert.equal(requests, 1);
     assert.equal(serialized.includes("agrt_secret_key"), false);
@@ -763,16 +1386,20 @@ test("upload-avatar dry-run validates file metadata and preflights without uploa
 });
 
 test("upload-avatar posts multipart form data with API key header", async () => {
-  const avatarPath = await writeTempFile("avatar.png", tinyPng());
+  const avatarPath = await writeTempFile("avatar.png", pngFixture(256, 256));
   const seen = {};
+  let preflightRequests = 0;
+  let mutationRequests = 0;
 
   await withServer(async (request, response) => {
     if (request.url === "/api/agent-protocol") {
+      preflightRequests += 1;
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify(protocolResponse()));
       return;
     }
 
+    mutationRequests += 1;
     assert.equal(request.url, "/api/agents/lifecycle-agent/avatar");
     assert.equal(request.method, "POST");
     assert.equal(request.headers["x-api-key"], "agrt_secret_key");
@@ -798,21 +1425,40 @@ test("upload-avatar posts multipart form data with API key header", async () => 
       "agrt_secret_key",
       "--base-url",
       baseUrl,
+      "--confirm-write",
+      "true",
     ]);
     const serialized = JSON.stringify(result);
 
-    assert.equal(result.ok, true);
-    assert.equal(result.command, "upload-avatar");
-    assert.equal(result.publicPath, "/uploads/agents/lifecycle-agent/avatar.png");
-    assert.equal(result.avatarUrl, `${baseUrl}/uploads/agents/lifecycle-agent/avatar.png`);
+    assert.deepEqual(result, {
+      ok: true,
+      command: "upload-avatar",
+      avatar: {
+        id: "avatar_1",
+        path: "/uploads/agents/lifecycle-agent/avatar.png",
+      },
+      publicPath: "/uploads/agents/lifecycle-agent/avatar.png",
+      avatarUrl: `${baseUrl}/uploads/agents/lifecycle-agent/avatar.png`,
+      file: {
+        name: "avatar.png",
+        bytes: 33,
+        contentType: "image/png",
+        width: 256,
+        height: 256,
+        field: "file",
+      },
+      warnings: [],
+    });
     assert.match(seen.body, /name="file"; filename="avatar\.png"/u);
     assert.match(seen.body, /Content-Type: image\/png/u);
+    assert.equal(preflightRequests, 1);
+    assert.equal(mutationRequests, 1);
     assert.equal(serialized.includes("agrt_secret_key"), false);
   });
 });
 
 test("upload-avatar rejects invalid inputs before mutation", async () => {
-  const validAvatarPath = await writeTempFile("avatar.png", tinyPng());
+  const validAvatarPath = await writeTempFile("avatar.png", pngFixture(256, 256));
   const avatarPath = await writeTempFile("avatar.gif", Buffer.from("GIF89a", "ascii"));
 
   const missingSlug = await runCliFailure([
@@ -886,6 +1532,89 @@ test("upload-avatar rejects invalid inputs before mutation", async () => {
   assert.match(invalidContent.stderr, /does not match image\/png/u);
 });
 
+test("upload-avatar accepts PNG, JPEG, and WebP dimensions at inclusive boundaries", async () => {
+  const fixtures = [
+    ["avatar.png", pngFixture(128, 128), "image/png", 128, 128],
+    ["avatar.jpg", jpegFixture(2048, 2048), "image/jpeg", 2048, 2048],
+    ["avatar-vp8.webp", webpVp8Fixture(512, 768), "image/webp", 512, 768],
+    ["avatar-vp8l.webp", webpVp8lFixture(640, 480), "image/webp", 640, 480],
+    ["avatar-vp8x.webp", webpVp8xFixture(1024, 1536), "image/webp", 1024, 1536],
+  ];
+
+  await withServer((request, response) => {
+    assert.equal(request.url, "/api/agent-protocol");
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify(protocolResponse()));
+  }, async (baseUrl) => {
+    for (const [name, contents, contentType, width, height] of fixtures) {
+      const avatarPath = await writeTempFile(name, contents);
+      const result = await runCli([
+        "upload-avatar",
+        "--file",
+        avatarPath,
+        "--slug",
+        "lifecycle-agent",
+        "--api-key",
+        "agrt_secret_key",
+        "--base-url",
+        baseUrl,
+        "--dry-run",
+        "true",
+      ]);
+
+      assert.equal(result.file.contentType, contentType);
+      assert.equal(result.file.width, width);
+      assert.equal(result.file.height, height);
+    }
+  });
+});
+
+test("upload-avatar rejects malformed and out-of-range dimensions before preflight", async (t) => {
+  const fixtures = [
+    ["too-small.png", pngFixture(1, 1), /between 128 and 2048 pixels/u],
+    ["too-wide.jpg", jpegFixture(4096, 128), /between 128 and 2048 pixels/u],
+    ["truncated.webp", webpVp8xFixture(256, 256).subarray(0, 24), /Malformed WebP image/u],
+    ["vp8-inter-frame.webp", webpVp8Fixture(256, 256, { frameTag: 0x01 }), /Malformed WebP image/u],
+    ["vp8l-version.webp", webpVp8lFixture(256, 256, { version: 1 }), /Malformed WebP image/u],
+    ["vp8x-reserved-flag.webp", webpVp8xFixture(256, 256, { flags: 0x01 }), /Malformed WebP image/u],
+    ["vp8x-reserved-byte.webp", webpVp8xFixture(256, 256, { reservedBytes: [0x01, 0x00, 0x00] }), /Malformed WebP image/u],
+    ["signature-only.png", Buffer.from("89504e470d0a1a0a", "hex"), /Malformed PNG image/u],
+    ["signature-only.jpg", Buffer.from("ffd8ff", "hex"), /Malformed JPEG image/u],
+    ["signature-only.webp", Buffer.from("524946460000000057454250", "hex"), /Malformed WebP image/u],
+  ];
+  let requests = 0;
+
+  await withServer((_request, response) => {
+    requests += 1;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify(protocolResponse()));
+  }, async (baseUrl) => {
+    for (const [name, contents, expectedError] of fixtures) {
+      await t.test(name, async () => {
+        const avatarPath = await writeTempFile(name, contents);
+        const result = await runCliFailure([
+          "upload-avatar",
+          "--file",
+          avatarPath,
+          "--slug",
+          "lifecycle-agent",
+          "--api-key",
+          "agrt_secret_key",
+          "--base-url",
+          baseUrl,
+          "--dry-run",
+          "true",
+        ]);
+
+        assert.equal(result.code, 1);
+        assert.match(result.stderr, expectedError);
+      });
+    }
+  });
+
+  assert.equal(requests, 0);
+});
+
 test("feed-stream reads public SSE events and exits after max events", async () => {
   await withServer((request, response) => {
     assert.equal(request.url, "/api/feed/stream");
@@ -954,6 +1683,335 @@ test("state command fails when the requested state file is missing", async () =>
   assert.match(result.stderr, /Registration state file not found/u);
 });
 
+const SUCCESS_COMMAND_CASES = [
+  {
+    command: "claim",
+    method: "POST",
+    route: "/api/agents/claim",
+    args: ["--slug", "lifecycle-agent", "--api-key", "agrt_test_key", "--email", "owner@example.com"],
+    requestBody: {
+      agentSlug: "lifecycle-agent",
+      apiKey: "agrt_test_key",
+      email: "owner@example.com",
+    },
+    response: {
+      claimed: true,
+      agentId: "agt_1",
+      email: "owner@example.com",
+      recoveryToken: "recovery_test_token",
+    },
+    expected: {
+      ok: true,
+      command: "claim",
+      claimed: true,
+      agentId: "agt_1",
+      email: "owner@example.com",
+      recoveryToken: "recovery_test_token",
+    },
+  },
+  {
+    command: "rotate-key",
+    method: "POST",
+    route: "/api/agents/lifecycle-agent/keys/rotate",
+    args: ["--slug", "lifecycle-agent", "--api-key", "agrt_test_key"],
+    requestBody: { apiKey: "agrt_test_key" },
+    response: {
+      agent: { id: "agt_1", slug: "lifecycle-agent" },
+      apiKey: "agrt_rotated_key",
+      keyPrefix: "agrt_rot",
+      recoveryToken: "recovery_rotated_token",
+    },
+    expected: {
+      ok: true,
+      command: "rotate-key",
+      agent: { id: "agt_1", slug: "lifecycle-agent" },
+      apiKey: "agrt_rotated_key",
+      keyPrefix: "agrt_rot",
+      recoveryToken: "recovery_rotated_token",
+    },
+  },
+  {
+    command: "get-profile",
+    method: "GET",
+    route: "/api/agents/lifecycle-agent",
+    args: ["--slug", "lifecycle-agent"],
+    response: {
+      profile: { slug: "lifecycle-agent", name: "Lifecycle Agent" },
+    },
+    expected: {
+      ok: true,
+      command: "get-profile",
+      profile: { slug: "lifecycle-agent", name: "Lifecycle Agent" },
+      publicPath: "/agents/lifecycle-agent",
+    },
+  },
+  {
+    command: "update-profile",
+    method: "PATCH",
+    route: "/api/agents/lifecycle-agent",
+    args: ["--slug", "lifecycle-agent", "--api-key", "agrt_test_key"],
+    payload: { tagline: "Updated lifecycle profile" },
+    response: {
+      profile: { slug: "lifecycle-agent", tagline: "Updated lifecycle profile" },
+    },
+    expected: {
+      ok: true,
+      command: "update-profile",
+      profile: { slug: "lifecycle-agent", tagline: "Updated lifecycle profile" },
+      publicPath: "/agents/lifecycle-agent",
+    },
+  },
+  {
+    command: "publish-update",
+    method: "POST",
+    route: "/api/agents/lifecycle-agent/updates",
+    args: ["--slug", "lifecycle-agent", "--api-key", "agrt_test_key"],
+    payload: {
+      title: "Lifecycle launch",
+      summary: "Published the lifecycle release.",
+      whatChanged: "Added portable release verification.",
+      signalType: "launch",
+    },
+    response: {
+      update: { id: "update_1", slug: "lifecycle-launch" },
+    },
+    expected: {
+      ok: true,
+      command: "publish-update",
+      id: "update_1",
+      publicPath: "/agents/lifecycle-agent/updates/lifecycle-launch",
+    },
+  },
+  {
+    command: "publish-prompt",
+    method: "POST",
+    route: "/api/agents/lifecycle-agent/prompts",
+    args: ["--slug", "lifecycle-agent", "--api-key", "agrt_test_key"],
+    payload: {
+      title: "Lifecycle summary",
+      description: "Summarizes lifecycle evidence.",
+      prompt: "Summarize the lifecycle evidence.",
+      expectedOutput: "A concise lifecycle summary.",
+    },
+    response: {
+      prompt: { id: "prompt_1", slug: "lifecycle-summary" },
+      publicPath: "/prompts/lifecycle-summary",
+    },
+    expected: {
+      ok: true,
+      command: "publish-prompt",
+      id: "prompt_1",
+      publicPath: "/prompts/lifecycle-summary",
+    },
+  },
+];
+
+test("core public commands preserve their route, auth, request, preflight, and response contracts", async (t) => {
+  for (const commandCase of SUCCESS_COMMAND_CASES) {
+    await t.test(commandCase.command, async () => {
+      const inputPath = commandCase.payload
+        ? await writePayload(`${commandCase.command}.json`, commandCase.payload)
+        : null;
+      let preflightRequests = 0;
+      let operationRequests = 0;
+
+      await withServer(async (request, response) => {
+        if (request.url === "/api/agent-protocol") {
+          preflightRequests += 1;
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end(JSON.stringify(protocolResponse()));
+          return;
+        }
+
+        operationRequests += 1;
+        assert.equal(request.method, commandCase.method);
+        assert.equal(request.url, commandCase.route);
+        assert.equal(
+          request.headers["x-api-key"],
+          ["update-profile", "publish-update", "publish-prompt"].includes(commandCase.command)
+            ? "agrt_test_key"
+            : undefined,
+        );
+        if (commandCase.requestBody || commandCase.payload) {
+          assert.deepEqual(
+            JSON.parse(await readRequestBody(request)),
+            commandCase.requestBody ?? commandCase.payload,
+          );
+        }
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify(commandCase.response));
+      }, async (baseUrl) => {
+        const result = await runCli([
+          commandCase.command,
+          ...commandCase.args,
+          ...(inputPath ? ["--input", inputPath] : []),
+          "--base-url",
+          baseUrl,
+          ...(["get-profile"].includes(commandCase.command) ? [] : ["--confirm-write", "true"]),
+        ]);
+
+        assert.deepEqual(result, {
+          ...commandCase.expected,
+          ...("publicPath" in commandCase.expected
+            ? { publicUrl: `${baseUrl}${commandCase.expected.publicPath}` }
+            : {}),
+        });
+        assert.equal(preflightRequests, commandCase.command === "get-profile" ? 0 : 1);
+        assert.equal(operationRequests, 1);
+      });
+    });
+  }
+});
+
+test("core public writes support dry-run and reject missing confirmation without mutation", async (t) => {
+  const writeCases = SUCCESS_COMMAND_CASES.filter(({ command }) => command !== "get-profile");
+
+  for (const commandCase of writeCases) {
+    await t.test(commandCase.command, async () => {
+      const inputPath = commandCase.payload
+        ? await writePayload(`${commandCase.command}.json`, commandCase.payload)
+        : null;
+      const baseArgs = [
+        commandCase.command,
+        ...commandCase.args,
+        ...(inputPath ? ["--input", inputPath] : []),
+      ];
+
+      for (const phase of ["dry-run", "missing-confirmation"]) {
+        let preflightRequests = 0;
+        let operationRequests = 0;
+
+        await withServer((request, response) => {
+          if (request.url === "/api/agent-protocol") {
+            preflightRequests += 1;
+            response.writeHead(200, { "content-type": "application/json" });
+            response.end(JSON.stringify(protocolResponse()));
+            return;
+          }
+
+          operationRequests += 1;
+          response.writeHead(500, { "content-type": "application/json" });
+          response.end(JSON.stringify({ error: "unexpected mutation" }));
+        }, async (baseUrl) => {
+          const args = [...baseArgs, "--base-url", baseUrl];
+          if (phase === "dry-run") {
+            const result = await runCli([...args, "--dry-run", "true"]);
+            assert.equal(result.ok, true);
+            assert.equal(result.command, commandCase.command);
+            assert.equal(result.dryRun, true);
+            assert.equal(result.contractVersion, "2026.05.16");
+          } else {
+            const result = await runCliFailure(args);
+            assert.match(result.stderr, /--confirm-write true is required for live writes/u);
+          }
+        });
+
+        assert.equal(preflightRequests, 1, `${commandCase.command} ${phase} preflight`);
+        assert.equal(operationRequests, 0, `${commandCase.command} ${phase} mutation`);
+      }
+    });
+  }
+});
+
+test("remaining public writes independently preflight dry-run and missing-confirmation phases", async (t) => {
+  const registerPath = await writePayload("register-guards.json", {
+    name: "Lifecycle Agent",
+    tagline: "Uses AgentRiot.",
+    description: "Exercises registration guards.",
+  });
+  const registerStatePath = `${registerPath}.explicit-state.json`;
+  const seededRegisterState = '{"installationId":"install_seeded_1234567890","agentSlug":"seeded-agent","apiKey":"agrt_seeded_key"}\n';
+  await writeFile(registerStatePath, seededRegisterState, "utf8");
+  const updatePath = await writePayload("edit-update-guards.json", {
+    title: "Updated launch note",
+    summary: "Clarifies the public launch summary.",
+    whatChanged: "Corrected the public-safe details.",
+    signalType: "status",
+  });
+  const promptPath = await writePayload("edit-prompt-guards.json", {
+    title: "Updated research brief",
+    description: "Clarifies when to use the prompt.",
+    prompt: "Summarize the notes into findings and risks.",
+    expectedOutput: "Findings and risks.",
+  });
+  const playbookPath = await writePayload("playbook-guards.json", validPlaybookPayload());
+  const avatarPath = await writeTempFile("avatar-guards.png", pngFixture(256, 256));
+  const cases = [
+    {
+      command: "register",
+      args: ["--input", registerPath, "--state-file", registerStatePath],
+      statePath: registerStatePath,
+    },
+    {
+      command: "edit-update",
+      args: ["--input", updatePath, "--slug", "lifecycle-agent", "--update-slug", "launch-update", "--api-key", "agrt_test_key"],
+    },
+    {
+      command: "edit-prompt",
+      args: ["--input", promptPath, "--slug", "lifecycle-agent", "--prompt-slug", "research-brief", "--api-key", "agrt_test_key"],
+    },
+    {
+      command: "publish-playbook",
+      args: ["--input", playbookPath, "--slug", "lifecycle-agent", "--api-key", "agrt_test_key"],
+    },
+    {
+      command: "edit-playbook",
+      args: ["--input", playbookPath, "--slug", "lifecycle-agent", "--playbook-slug", "daily-launch-review", "--api-key", "agrt_test_key"],
+    },
+    {
+      command: "upload-avatar",
+      args: ["--file", avatarPath, "--slug", "lifecycle-agent", "--api-key", "agrt_test_key"],
+    },
+  ];
+
+  for (const commandCase of cases) {
+    await t.test(commandCase.command, async () => {
+      for (const phase of ["dry-run", "missing-confirmation"]) {
+        let preflightRequests = 0;
+        let mutationRequests = 0;
+        const stateBefore = commandCase.statePath
+          ? await readFile(commandCase.statePath, "utf8")
+          : null;
+
+        await withServer((request, response) => {
+          if (request.url === "/api/agent-protocol") {
+            preflightRequests += 1;
+            response.writeHead(200, { "content-type": "application/json" });
+            response.end(JSON.stringify(protocolResponse()));
+            return;
+          }
+
+          mutationRequests += 1;
+          response.writeHead(500, { "content-type": "application/json" });
+          response.end(JSON.stringify({ error: "unexpected mutation" }));
+        }, async (baseUrl) => {
+          const args = [commandCase.command, ...commandCase.args, "--base-url", baseUrl];
+          if (phase === "dry-run") {
+            const result = await runCli([...args, "--dry-run", "true"]);
+            assert.equal(result.ok, true);
+            assert.equal(result.command, commandCase.command);
+            assert.equal(result.dryRun, true);
+            assert.equal(result.contractVersion, "2026.05.16");
+          } else {
+            const result = await runCliFailure(args);
+            assert.match(result.stderr, /--confirm-write true is required for live writes/u);
+          }
+        });
+
+        const expectedPreflights = commandCase.command === "register" && phase === "missing-confirmation"
+          ? 0
+          : 1;
+        assert.equal(preflightRequests, expectedPreflights, `${commandCase.command} ${phase} preflight`);
+        assert.equal(mutationRequests, 0, `${commandCase.command} ${phase} mutation`);
+        if (commandCase.statePath) {
+          const stateAfter = await readFile(commandCase.statePath, "utf8");
+          assert.equal(stateAfter, stateBefore, `${commandCase.command} ${phase} state bytes`);
+        }
+      }
+    });
+  }
+});
+
 test("server validation errors include field-specific details", async () => {
   const inputPath = await writePayload("prompt.json", {
     title: "Research brief prompt",
@@ -989,6 +2047,8 @@ test("server validation errors include field-specific details", async () => {
       "agrt_secret_key",
       "--base-url",
       baseUrl,
+      "--confirm-write",
+      "true",
     ]);
 
     assert.equal(result.code, 1);
@@ -1006,14 +2066,18 @@ test("edit-update patches an existing timeline update", async () => {
     signalType: "status",
     skillsTools: ["release"],
   });
+  let preflightRequests = 0;
+  let mutationRequests = 0;
 
   await withServer(async (request, response) => {
     if (request.url === "/api/agent-protocol") {
+      preflightRequests += 1;
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify(protocolResponse()));
       return;
     }
 
+    mutationRequests += 1;
     assert.equal(request.method, "PATCH");
     assert.equal(request.url, "/api/agents/lifecycle-agent/updates/launch-update");
     assert.equal(request.headers["x-api-key"], "agrt_test_key");
@@ -1045,32 +2109,47 @@ test("edit-update patches an existing timeline update", async () => {
       "agrt_test_key",
       "--base-url",
       baseUrl,
+      "--confirm-write",
+      "true",
     ]);
 
-    assert.equal(result.command, "edit-update");
-    assert.equal(result.publicPath, "/agents/lifecycle-agent/updates/launch-update");
+    assert.deepEqual(result, {
+      ok: true,
+      command: "edit-update",
+      id: "update_1",
+      publicPath: "/agents/lifecycle-agent/updates/launch-update",
+      publicUrl: `${baseUrl}/agents/lifecycle-agent/updates/launch-update`,
+    });
+    assert.equal(preflightRequests, 1);
+    assert.equal(mutationRequests, 1);
   });
 });
 
 test("edit-prompt patches an existing shared prompt", async () => {
-  const inputPath = await writePayload("prompt.json", {
+  const payload = {
     title: "Updated research brief",
     description: "Clarifies when to use the prompt.",
     prompt: "Summarize the notes into findings and risks.",
     expectedOutput: "Findings and risks.",
     tags: ["research"],
-  });
+  };
+  const inputPath = await writePayload("prompt.json", payload);
+  let preflightRequests = 0;
+  let mutationRequests = 0;
 
   await withServer(async (request, response) => {
     if (request.url === "/api/agent-protocol") {
+      preflightRequests += 1;
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify(protocolResponse()));
       return;
     }
 
+    mutationRequests += 1;
     assert.equal(request.method, "PATCH");
     assert.equal(request.url, "/api/agents/lifecycle-agent/prompts/research-brief");
     assert.equal(request.headers["x-api-key"], "agrt_test_key");
+    assert.deepEqual(JSON.parse(await readRequestBody(request)), payload);
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify({
       prompt: {
@@ -1093,10 +2172,19 @@ test("edit-prompt patches an existing shared prompt", async () => {
       "agrt_test_key",
       "--base-url",
       baseUrl,
+      "--confirm-write",
+      "true",
     ]);
 
-    assert.equal(result.command, "edit-prompt");
-    assert.equal(result.publicPath, "/prompts/research-brief");
+    assert.deepEqual(result, {
+      ok: true,
+      command: "edit-prompt",
+      id: "prompt_1",
+      publicPath: "/prompts/research-brief",
+      publicUrl: `${baseUrl}/prompts/research-brief`,
+    });
+    assert.equal(preflightRequests, 1);
+    assert.equal(mutationRequests, 1);
   });
 });
 
@@ -1104,10 +2192,12 @@ test("publish-playbook posts a public playbook with API key header", async () =>
   const payload = validPlaybookPayload();
   const inputPath = await writePayload("playbook.json", payload);
   let seenBody = null;
+  let preflightRequests = 0;
   let mutationRequests = 0;
 
   await withServer(async (request, response) => {
     if (request.url === "/api/agent-protocol") {
+      preflightRequests += 1;
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify(protocolResponse()));
       return;
@@ -1138,15 +2228,29 @@ test("publish-playbook posts a public playbook with API key header", async () =>
       "agrt_secret_key",
       "--base-url",
       baseUrl,
+      "--confirm-write",
+      "true",
     ]);
     const serialized = JSON.stringify(result);
 
-    assert.equal(result.ok, true);
-    assert.equal(result.command, "publish-playbook");
-    assert.equal(result.publicPath, "/playbooks/daily-launch-review");
-    assert.equal(result.publicUrl, `${baseUrl}/playbooks/daily-launch-review`);
-    assert.equal(result.playbook.slug, "daily-launch-review");
+    assert.deepEqual(result, {
+      ok: true,
+      command: "publish-playbook",
+      id: "playbook_1",
+      playbook: {
+        id: "playbook_1",
+        slug: "daily-launch-review",
+        title: payload.title,
+      },
+      canonicalPath: "/playbooks/daily-launch-review",
+      playbookPath: "/playbooks/daily-launch-review",
+      publicPath: "/playbooks/daily-launch-review",
+      canonicalUrl: `${baseUrl}/playbooks/daily-launch-review`,
+      publicUrl: `${baseUrl}/playbooks/daily-launch-review`,
+      validationWarnings: [],
+    });
     assert.deepEqual(seenBody, payload);
+    assert.equal(preflightRequests, 1);
     assert.equal(mutationRequests, 1);
     assert.equal(serialized.includes("agrt_secret_key"), false);
   });
@@ -1190,6 +2294,8 @@ test("publish-playbook posts an Agent Loop and reports canonical loop paths", as
       "agrt_secret_key",
       "--base-url",
       baseUrl,
+      "--confirm-write",
+      "true",
     ]);
     const serialized = JSON.stringify(result);
 
@@ -1210,14 +2316,18 @@ test("edit-playbook patches an existing public playbook", async () => {
   const payload = validPlaybookPayload({ title: "Updated daily launch review" });
   const inputPath = await writePayload("playbook.json", payload);
   let seenBody = null;
+  let preflightRequests = 0;
+  let mutationRequests = 0;
 
   await withServer(async (request, response) => {
     if (request.url === "/api/agent-protocol") {
+      preflightRequests += 1;
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify(protocolResponse()));
       return;
     }
 
+    mutationRequests += 1;
     assert.equal(request.method, "PATCH");
     assert.equal(request.url, "/api/agents/lifecycle-agent/playbooks/daily-launch-review");
     assert.equal(request.headers["x-api-key"], "agrt_secret_key");
@@ -1244,13 +2354,29 @@ test("edit-playbook patches an existing public playbook", async () => {
       "agrt_secret_key",
       "--base-url",
       baseUrl,
+      "--confirm-write",
+      "true",
     ]);
 
-    assert.equal(result.ok, true);
-    assert.equal(result.command, "edit-playbook");
-    assert.equal(result.publicPath, "/playbooks/daily-launch-review");
-    assert.equal(result.publicUrl, `${baseUrl}/playbooks/daily-launch-review`);
+    assert.deepEqual(result, {
+      ok: true,
+      command: "edit-playbook",
+      id: "playbook_1",
+      playbook: {
+        id: "playbook_1",
+        slug: "daily-launch-review",
+        title: payload.title,
+      },
+      canonicalPath: "/playbooks/daily-launch-review",
+      playbookPath: "/playbooks/daily-launch-review",
+      publicPath: "/playbooks/daily-launch-review",
+      canonicalUrl: `${baseUrl}/playbooks/daily-launch-review`,
+      publicUrl: `${baseUrl}/playbooks/daily-launch-review`,
+      validationWarnings: [],
+    });
     assert.deepEqual(seenBody, payload);
+    assert.equal(preflightRequests, 1);
+    assert.equal(mutationRequests, 1);
   });
 });
 
@@ -1295,6 +2421,8 @@ test("edit-playbook patches an Agent Loop and keeps canonical loop path", async 
       "agrt_secret_key",
       "--base-url",
       baseUrl,
+      "--confirm-write",
+      "true",
     ]);
 
     assert.equal(result.ok, true);
@@ -1306,6 +2434,261 @@ test("edit-playbook patches an Agent Loop and keeps canonical loop path", async 
     assert.equal(result.publicUrl, `${baseUrl}/loops/launch-evidence-loop`);
     assert.deepEqual(seenBody, payload);
   });
+});
+
+const DELETE_CASES = [
+  {
+    command: "delete-update",
+    slugFlag: "update-slug",
+    itemSlug: "launch-update",
+    route: "/api/agents/lifecycle-agent/updates/launch-update",
+    publicPath: "/agents/lifecycle-agent/updates/launch-update",
+  },
+  {
+    command: "delete-prompt",
+    slugFlag: "prompt-slug",
+    itemSlug: "research-brief",
+    route: "/api/agents/lifecycle-agent/prompts/research-brief",
+    publicPath: "/prompts/research-brief",
+  },
+  {
+    command: "delete-playbook",
+    slugFlag: "playbook-slug",
+    itemSlug: "daily-launch-review",
+    route: "/api/agents/lifecycle-agent/playbooks/daily-launch-review",
+    publicPath: "/playbooks/daily-launch-review",
+  },
+];
+
+for (const deletion of DELETE_CASES) {
+  test(`${deletion.command} deletes an existing public resource`, async () => {
+    let preflightRequests = 0;
+    let mutationRequests = 0;
+
+    await withServer((request, response) => {
+      if (request.url === "/api/agent-protocol") {
+        preflightRequests += 1;
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify(protocolResponse()));
+        return;
+      }
+
+      mutationRequests += 1;
+      assert.equal(request.method, "DELETE");
+      assert.equal(request.url, deletion.route);
+      assert.equal(request.headers["x-api-key"], "agrt_test_key");
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        deleted: true,
+        publicPath: deletion.publicPath,
+      }));
+    }, async (baseUrl) => {
+      const result = await runCli([
+        deletion.command,
+        "--slug",
+        "lifecycle-agent",
+        `--${deletion.slugFlag}`,
+        deletion.itemSlug,
+        "--api-key",
+        "agrt_test_key",
+        "--base-url",
+        baseUrl,
+        "--confirm-write",
+        "true",
+      ]);
+
+      assert.deepEqual(result, {
+        ok: true,
+        command: deletion.command,
+        deleted: true,
+        publicPath: deletion.publicPath,
+        publicUrl: `${baseUrl}${deletion.publicPath}`,
+      });
+      assert.equal(preflightRequests, 1);
+      assert.equal(mutationRequests, 1);
+    });
+  });
+}
+
+test("delete server errors include field-specific details", async () => {
+  await withServer((request, response) => {
+    if (request.url === "/api/agent-protocol") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(protocolResponse()));
+      return;
+    }
+
+    assert.equal(request.method, "DELETE");
+    assert.equal(request.url, "/api/agents/lifecycle-agent/prompts/research-brief");
+    response.writeHead(409, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      error: "Delete failed",
+      fields: {
+        promptSlug: "prompt is still referenced",
+      },
+    }));
+  }, async (baseUrl) => {
+    const result = await runCliFailure([
+      "delete-prompt",
+      "--slug",
+      "lifecycle-agent",
+      "--prompt-slug",
+      "research-brief",
+      "--api-key",
+      "agrt_test_key",
+      "--base-url",
+      baseUrl,
+      "--confirm-write",
+      "true",
+    ]);
+
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /Delete failed: promptSlug: prompt is still referenced/u);
+  });
+});
+
+test("delete error sanitizes reflected secrets and bounds stderr", async () => {
+  const apiKey = "agrt_exact_configured_api_secret";
+  const recoveryToken = "recovery_exact_configured_secret";
+  const reflectedBearer = "eyJhbGciOiJIUzI1NiJ9.reflected.signature";
+  const reflectedApiKey = "agrt_server_reflected_secret";
+  const reflectedLabeledKey = "ZYXWVUTSRQPONMLK";
+
+  await withServer((request, response) => {
+    if (request.url === "/api/agent-protocol") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(protocolResponse()));
+      return;
+    }
+
+    assert.equal(request.method, "DELETE");
+    response.writeHead(400, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      error: `Rejected ${apiKey} and ${recoveryToken}`,
+      details: [
+        `Fetch https://alice:password@example.com/private with Bearer ${reflectedBearer}`,
+        "Database postgresql://admin:database-password@example.com/private",
+        "Mirror ftp://ftp-user:ftp-password@example.com/private",
+        `API key: ${reflectedLabeledKey}`,
+        { field: "apiKey", message: reflectedApiKey },
+        { field: "payload", message: "x".repeat(4000) },
+      ],
+    }));
+  }, async (baseUrl) => {
+    const result = await runCliFailure([
+      "delete-update",
+      "--slug",
+      "lifecycle-agent",
+      "--update-slug",
+      "launch-update",
+      "--api-key",
+      apiKey,
+      "--base-url",
+      baseUrl,
+      "--confirm-write",
+      "true",
+    ], {
+      env: {
+        AGENTRIOT_RECOVERY_TOKEN: recoveryToken,
+      },
+    });
+
+    assert.equal(result.code, 1);
+    assert.equal(result.stderr.includes(apiKey), false);
+    assert.equal(result.stderr.includes(recoveryToken), false);
+    assert.equal(result.stderr.includes("alice"), false);
+    assert.equal(result.stderr.includes("password"), false);
+    assert.equal(result.stderr.includes(reflectedBearer), false);
+    assert.equal(result.stderr.includes(reflectedApiKey), false);
+    assert.equal(result.stderr.includes(reflectedLabeledKey), false);
+    assert.equal(result.stderr.includes("admin"), false);
+    assert.equal(result.stderr.includes("database-password"), false);
+    assert.equal(result.stderr.includes("ftp-user"), false);
+    assert.equal(result.stderr.includes("ftp-password"), false);
+    assert.ok(result.stderr.length <= 513, `stderr length was ${result.stderr.length}`);
+    assert.match(result.stderr, /\[REDACTED\]/u);
+  });
+});
+
+test("delete dry-run performs only protocol preflight for all commands", async () => {
+  for (const deletion of DELETE_CASES) {
+    let preflightRequests = 0;
+    let deleteRequests = 0;
+
+    await withServer((request, response) => {
+      if (request.url === "/api/agent-protocol") {
+        preflightRequests += 1;
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify(protocolResponse()));
+        return;
+      }
+
+      if (request.method === "DELETE") deleteRequests += 1;
+      response.writeHead(500, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: "unexpected mutation" }));
+    }, async (baseUrl) => {
+      const result = await runCli([
+        deletion.command,
+        "--slug",
+        "lifecycle-agent",
+        `--${deletion.slugFlag}`,
+        deletion.itemSlug,
+        "--api-key",
+        "agrt_test_key",
+        "--base-url",
+        baseUrl,
+        "--dry-run",
+        "true",
+      ]);
+
+      assert.equal(result.command, deletion.command);
+      assert.equal(result.dryRun, true);
+      assert.equal(preflightRequests, 1);
+      assert.equal(deleteRequests, 0);
+    });
+  }
+});
+
+test("delete confirmation rejects missing and false values without DELETE", async () => {
+  for (const deletion of DELETE_CASES) {
+    for (const confirmation of ["missing", "false"]) {
+      let preflightRequests = 0;
+      let deleteRequests = 0;
+
+      await withServer((request, response) => {
+        if (request.url === "/api/agent-protocol") {
+          preflightRequests += 1;
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end(JSON.stringify(protocolResponse()));
+          return;
+        }
+
+        if (request.method === "DELETE") deleteRequests += 1;
+        response.writeHead(500, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: "unexpected mutation" }));
+      }, async (baseUrl) => {
+        const baseArgs = [
+          deletion.command,
+          "--slug",
+          "lifecycle-agent",
+          `--${deletion.slugFlag}`,
+          deletion.itemSlug,
+          "--api-key",
+          "agrt_test_key",
+          "--base-url",
+          baseUrl,
+        ];
+        const result = await runCliFailure(confirmation === "false"
+          ? [...baseArgs, "--confirm-write", "false"]
+          : baseArgs);
+
+        assert.match(result.stderr, /--confirm-write true is required for live writes/u);
+      });
+
+      assert.equal(preflightRequests, 1, `${deletion.command} ${confirmation} preflight`);
+      assert.equal(deleteRequests, 0, `${deletion.command} ${confirmation} mutation`);
+    }
+  }
 });
 
 test("edit commands support dry-run validation without mutation", async () => {
@@ -1456,6 +2839,128 @@ test("skill frontmatter is GitHub-compatible YAML", async () => {
   assert.match(frontmatter, /^description: "/m);
 });
 
+test("portable skill frontmatter uses standard fields and broad AgentRiot triggers", async () => {
+  const skill = await readFile(new URL("../SKILL.md", import.meta.url), "utf8");
+  const frontmatter = skill.match(/^---\n(?<yaml>[\s\S]*?)\n---/u)?.groups?.yaml;
+
+  assert.ok(frontmatter);
+  assert.match(frontmatter, /^name: agentriot$/mu);
+  assert.match(frontmatter, /^license: MIT$/mu);
+  assert.match(frontmatter, /^compatibility: /mu);
+  const runtimeBoundFieldPattern = /^(?:model|(?:openclaw|hermes|codex|claude|gemini|copilot)(?:[-_][a-z0-9_-]+)?):/imu;
+  assert.doesNotMatch(frontmatter, runtimeBoundFieldPattern);
+  assert.doesNotMatch("metadata:\n  owner: agentriot", runtimeBoundFieldPattern);
+  assert.doesNotMatch("allowed-tools: Bash", runtimeBoundFieldPattern);
+  for (const runtimeBoundField of [
+    "model: vendor-frontier",
+    "openclaw: workspace-only",
+    "hermes-tools: runtime-only",
+    "codex_metadata: runtime-only",
+  ]) {
+    assert.match(runtimeBoundField, runtimeBoundFieldPattern);
+  }
+
+  for (const trigger of [
+    "autonomous agent",
+    "operator",
+    "join AgentRiot",
+    "profile",
+    "updates",
+    "prompts",
+    "Playbooks",
+    "Agent Loops",
+    "avatar",
+    "feed",
+    "credentials",
+    "registration state",
+    "remove public work",
+    "protocol",
+  ]) {
+    assert.ok(frontmatter.includes(trigger), `missing portable trigger: ${trigger}`);
+  }
+});
+
+test("portable skill documents bundled execution fallback and safe mutation flow", async () => {
+  const skill = await readFile(new URL("../SKILL.md", import.meta.url), "utf8");
+
+  assert.match(skill, /Use `agentriot` when it is available/u);
+  assert.match(skill, /node <skill-root>\/bin\/agentriot\.mjs <command>/u);
+  assert.doesNotMatch(skill, /\{baseDir\}|\$\{HERMES_SKILL_DIR\}/u);
+
+  for (const required of [
+    "check-updates",
+    "validate",
+    "--dry-run true",
+    "exact public mutation",
+    "--confirm-write true",
+    "verify",
+    "--skip-contract-check true",
+    "compatibility risk",
+  ]) {
+    assert.ok(skill.includes(required), `missing safe workflow phrase: ${required}`);
+  }
+});
+
+test("install guidance covers shared and major runtime skill directories", async () => {
+  const readme = await readFile(new URL("../README.md", import.meta.url), "utf8");
+
+  for (const installPath of [
+    ".agents/skills/agentriot",
+    ".openclaw/skills/agentriot",
+    ".hermes/skills/agentriot",
+    ".codex/skills/agentriot",
+    ".claude/skills/agentriot",
+    ".gemini/skills/agentriot",
+    ".copilot/skills/agentriot",
+  ]) {
+    assert.ok(readme.includes(installPath), `missing install directory: ${installPath}`);
+  }
+
+  assert.match(readme, /directory named `agentriot`/u);
+  assert.match(readme, /same `SKILL\.md`, `bin\/`, and `references\/`/u);
+  assert.doesNotMatch(readme, /separate (OpenClaw|Hermes|Codex|Claude|Gemini|Copilot) skill/iu);
+});
+
+test("portable validator guidance pins the verified skills-ref release", async () => {
+  const maintainerGuide = await readFile(new URL("../MAINTAINER_TESTING.md", import.meta.url), "utf8");
+
+  assert.match(
+    maintainerGuide,
+    /uvx --from skills-ref==0\.1\.1 agentskills validate \/tmp\/agentriot/u,
+  );
+  assert.doesNotMatch(maintainerGuide, /uvx --from skills-ref agentskills/u);
+});
+
+test("payload references provide a compact contents list", async () => {
+  const payloads = await readFile(new URL("../references/payloads.md", import.meta.url), "utf8");
+
+  assert.match(payloads, /## Contents/u);
+  for (const section of [
+    "Registration and profile payload",
+    "Update payload",
+    "Prompt payload",
+    "Playbook payload",
+    "Loop payload",
+    "Avatar upload",
+    "Feed stream",
+  ]) {
+    assert.match(payloads, new RegExp(`\\[${section}\\]\\(#[^)]+\\)`, "iu"));
+  }
+});
+
+test("published version artifacts stay synchronized at 0.11.0", async () => {
+  const root = new URL("../", import.meta.url);
+  const packageJson = JSON.parse(await readFile(new URL("package.json", root), "utf8"));
+  const cli = await readFile(new URL("bin/agentriot.mjs", root), "utf8");
+  const readme = await readFile(new URL("README.md", root), "utf8");
+  const apiReference = await readFile(new URL("references/public-api.md", root), "utf8");
+
+  assert.equal(packageJson.version, "0.11.0");
+  assert.match(cli, /const LOCAL_SKILL_VERSION = "0\.11\.0";/u);
+  assert.match(readme, /package version is `0\.11\.0`/u);
+  assert.match(apiReference, /package version is `0\.11\.0`/u);
+});
+
 test("public docs link to canonical AgentRiot references", async () => {
   const root = new URL("../", import.meta.url);
   const docs = [
@@ -1522,10 +3027,13 @@ test("public API matrix covers every known public endpoint", async () => {
     ["POST", "/api/agents/{slug}/keys/rotate", "rotate-key"],
     ["POST", "/api/agents/{slug}/updates", "publish-update"],
     ["PATCH", "/api/agents/{slug}/updates/{updateSlug}", "edit-update"],
+    ["DELETE", "/api/agents/{slug}/updates/{updateSlug}", "delete-update"],
     ["POST", "/api/agents/{slug}/prompts", "publish-prompt"],
     ["PATCH", "/api/agents/{slug}/prompts/{promptSlug}", "edit-prompt"],
+    ["DELETE", "/api/agents/{slug}/prompts/{promptSlug}", "delete-prompt"],
     ["POST", "/api/agents/{slug}/playbooks", "publish-playbook"],
     ["PATCH", "/api/agents/{slug}/playbooks/{playbookSlug}", "edit-playbook"],
+    ["DELETE", "/api/agents/{slug}/playbooks/{playbookSlug}", "delete-playbook"],
     ["POST", "/api/agents/{slug}/avatar", "upload-avatar"],
     ["GET", "/api/feed/stream", "feed-stream"],
   ];
@@ -1537,7 +3045,7 @@ test("public API matrix covers every known public endpoint", async () => {
 
   const uniquePaths = new Set(expected.map(([, path]) => path));
   assert.equal(uniquePaths.size, 15);
-  assert.match(matrix, /15 public paths and 16 covered method-level operations/u);
+  assert.match(matrix, /15 public paths and 19 covered method-level operations/u);
 });
 
 test("public npm commands are clearly framed as post-publish", async () => {
@@ -1557,4 +3065,418 @@ test("public npm commands are clearly framed as post-publish", async () => {
       `${name} contains npm commands without post-publish framing`,
     );
   }
+});
+
+test("base URLs reject credentials, query strings, and fragments without disclosure", async (t) => {
+  const cases = [
+    "https://base_user:base_password@example.com",
+    "https://example.com?apiKey=base_query_secret",
+    "https://example.com/#base_fragment_secret",
+  ];
+
+  for (const command of ["profile", "mcp-config", "check-updates"]) {
+    await t.test(command, async () => {
+      for (const baseUrl of cases) {
+        const result = await runCliFailure([
+          command,
+          ...(command === "profile" ? ["--slug", "portable-agent"] : []),
+          "--base-url",
+          baseUrl,
+        ]);
+        assert.equal(result.code, 1);
+        assert.match(result.stderr, /base URL must not include embedded credentials, a query string, or a fragment/u);
+        for (const secret of ["base_user", "base_password", "base_query_secret", "base_fragment_secret"]) {
+          assert.equal(result.stdout.includes(secret), false);
+          assert.equal(result.stderr.includes(secret), false);
+        }
+      }
+    });
+  }
+});
+
+test("validate recursively rejects normalized sensitive payload keys without echoing values", async (t) => {
+  const keyCases = [
+    "apiKey",
+    "api_key",
+    "x-api-key",
+    "recovery-token",
+    "Authorization",
+    "password",
+    "password_hash",
+    "client_secret",
+    "secretValue",
+    "token_value",
+    "accessToken",
+    "clientSecretValue",
+    "oauthAccessTokenHash",
+    "databasePasswordEncrypted",
+    "primaryApiKeyReference",
+    "oauthToken",
+    "authToken",
+    "bearerToken",
+    "refreshToken",
+    "sessionToken",
+    "apiToken",
+    "idToken",
+    "csrfToken",
+    "tokenHash",
+    "tokenSecret",
+    "tokenKey",
+    "tokenCredential",
+    "tokenEncrypted",
+    "tokenRaw",
+    "tokenHeader",
+    "tokenSignature",
+    "tokenDigest",
+    "mysteryTokenBudget",
+    "ACCESSTOKEN",
+    "mysterytokenbudget",
+  ];
+
+  for (const key of keyCases) {
+    await t.test(key, async () => {
+      const secret = `do-not-disclose-${key}`;
+      const inputPath = await writePayload("sensitive.json", {
+        title: "Public launch note",
+        summary: "A public-safe summary.",
+        whatChanged: "Published a bounded workflow.",
+        signalType: "status",
+        metadata: [{ nested: { [key]: secret } }],
+      });
+      const result = await runCliFailure(["validate", "--type", "update", "--input", inputPath]);
+      assert.match(result.stderr, /public payload must not include sensitive field metadata\.0\.nested\./u);
+      assert.equal(result.stdout.includes(secret), false);
+      assert.equal(result.stderr.includes(secret), false);
+    });
+  }
+});
+
+test("sensitive-name classification preserves obvious non-secret words", async () => {
+  const inputPath = await writePayload("non-sensitive-names.json", {
+    title: "Tokenizer secretary update",
+    summary: "Documents tokenizer and secretary behavior.",
+    whatChanged: "Added public terminology.",
+    signalType: "status",
+    metadata: {
+      secretary: "public role",
+      tokenizer: "public component",
+    },
+  });
+  const result = await runCli(["validate", "--type", "update", "--input", inputPath]);
+  assert.equal(result.validation.valid, true);
+});
+
+test("AI token metric field names are accepted only with safe qualifiers", async () => {
+  const inputPath = await writePayload("safe-token-metrics.json", {
+    title: "Token usage update",
+    summary: "Shares public AI usage metrics.",
+    whatChanged: "Added bounded model usage measurements.",
+    signalType: "status",
+    metrics: {
+      tokenBudget: 10000,
+      tokenCount: 4200,
+      tokenLimit: 12000,
+      tokenUsage: 4200,
+      inputTokenCount: 3000,
+      outputTokenCount: 1200,
+      totalTokenUsage: 4200,
+      promptTokenCount: 3000,
+      completionTokenCount: 1200,
+      INPUTTOKENCOUNT: 3000,
+    },
+  });
+  const result = await runCli(["validate", "--type", "update", "--input", inputPath]);
+  assert.equal(result.validation.valid, true);
+});
+
+test("update payload cleanup cannot hide sensitive keys in ignored fields", async () => {
+  const secret = "ignored-field-secret-value";
+  const inputPath = await writePayload("ignored-sensitive.json", {
+    title: "Public launch note",
+    summary: "A public-safe summary.",
+    whatChanged: "Published a bounded workflow.",
+    signalType: "status",
+    createdAt: { accessToken: secret },
+  });
+  const result = await runCliFailure(["validate", "--type", "update", "--input", inputPath]);
+  assert.match(result.stderr, /public payload must not include sensitive field createdAt\.accessToken/u);
+  assert.equal(result.stdout.includes(secret), false);
+  assert.equal(result.stderr.includes(secret), false);
+});
+
+test("every payload mutation rejects nested sensitive keys before preflight or mutation", async (t) => {
+  const secret = "payload-write-secret-value";
+  const cases = [
+    ["register", { name: "Portable Agent", tagline: "Shares public work.", description: "A portable public agent.", nested: { apiKey: secret } }, []],
+    ["update-profile", { name: "Portable Agent", nested: { password: secret } }, ["--slug", "portable-agent", "--api-key", "agrt_test_key"]],
+    ["publish-update", { title: "Public launch", summary: "A public summary.", whatChanged: "Added evidence.", signalType: "status", nested: { token: secret } }, ["--slug", "portable-agent", "--api-key", "agrt_test_key"]],
+    ["edit-update", { title: "Public launch", summary: "A public summary.", whatChanged: "Added evidence.", signalType: "status", nested: { authorization: secret } }, ["--slug", "portable-agent", "--api-key", "agrt_test_key", "--update-slug", "launch"]],
+    ["publish-prompt", { title: "Research brief", description: "Summarizes public research.", prompt: "Summarize this.", expectedOutput: "A brief.", nested: { recoveryToken: secret } }, ["--slug", "portable-agent", "--api-key", "agrt_test_key"]],
+    ["edit-prompt", { title: "Research brief", description: "Summarizes public research.", prompt: "Summarize this.", expectedOutput: "A brief.", nested: { clientSecret: secret } }, ["--slug", "portable-agent", "--api-key", "agrt_test_key", "--prompt-slug", "brief"]],
+    ["publish-playbook", { ...validPlaybookPayload(), nested: { access_token: secret } }, ["--slug", "portable-agent", "--api-key", "agrt_test_key"]],
+    ["edit-playbook", { ...validPlaybookPayload(), nested: { PASSWORD: secret } }, ["--slug", "portable-agent", "--api-key", "agrt_test_key", "--playbook-slug", "daily-launch-review"]],
+  ];
+
+  for (const [command, payload, extraArgs] of cases) {
+    await t.test(command, async () => {
+      const inputPath = await writePayload(`${command}-sensitive.json`, payload);
+      let requests = 0;
+      await withServer((_request, response) => {
+        requests += 1;
+        response.writeHead(500, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: "unexpected request" }));
+      }, async (baseUrl) => {
+        const result = await runCliFailure([
+          command,
+          "--input",
+          inputPath,
+          ...extraArgs,
+          "--base-url",
+          baseUrl,
+          "--confirm-write",
+          "true",
+        ]);
+        assert.match(result.stderr, /public payload must not include sensitive field/u);
+        assert.equal(result.stdout.includes(secret), false);
+        assert.equal(result.stderr.includes(secret), false);
+      });
+      assert.equal(requests, 0);
+    });
+  }
+});
+
+test("playbook and loop parameter names cannot describe sensitive values", async (t) => {
+  const secret = "parameter-secret-value-must-not-echo";
+  const cases = [
+    ["validate-playbook", "validate", validPlaybookPayload({ parameters: [{ name: "accessToken", value: secret }] }), ["--type", "playbook"]],
+    ["validate-loop", "validate", validLoopPayload({ parameters: [{ name: "oauthToken", value: secret }] }), ["--type", "loop"]],
+    ["publish-playbook", "publish-playbook", validPlaybookPayload({ parameters: [{ name: "authToken", value: secret }] }), ["--slug", "portable-agent", "--api-key", "agrt_test_key", "--confirm-write", "true"]],
+    ["edit-playbook", "edit-playbook", validPlaybookPayload({ parameters: [{ name: "tokenHash", value: secret }] }), ["--slug", "portable-agent", "--api-key", "agrt_test_key", "--playbook-slug", "daily-launch-review", "--confirm-write", "true"]],
+    ["publish-loop", "publish-playbook", validLoopPayload({ parameters: [{ name: "bearerToken", value: secret }] }), ["--slug", "portable-agent", "--api-key", "agrt_test_key", "--confirm-write", "true"]],
+    ["edit-loop", "edit-playbook", validLoopPayload({ parameters: [{ name: "mysteryTokenBudget", value: secret }] }), ["--slug", "portable-agent", "--api-key", "agrt_test_key", "--playbook-slug", "launch-loop", "--confirm-write", "true"]],
+  ];
+
+  for (const [name, command, payload, extraArgs] of cases) {
+    await t.test(name, async () => {
+      const inputPath = await writePayload(`${name}.json`, payload);
+      if (command === "validate") {
+        const result = await runCliFailure([command, "--input", inputPath, ...extraArgs]);
+        assert.match(result.stderr, /parameters\.0\.name must not describe a sensitive value/u);
+        assert.equal(result.stdout.includes(secret), false);
+        assert.equal(result.stderr.includes(secret), false);
+        return;
+      }
+
+      let requests = 0;
+      await withServer((_request, response) => {
+        requests += 1;
+        response.writeHead(500, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: "unexpected request" }));
+      }, async (baseUrl) => {
+        const result = await runCliFailure([
+          command,
+          "--input",
+          inputPath,
+          ...extraArgs,
+          "--base-url",
+          baseUrl,
+        ]);
+        assert.match(result.stderr, /parameters\.0\.name must not describe a sensitive value/u);
+        assert.equal(result.stdout.includes(secret), false);
+        assert.equal(result.stderr.includes(secret), false);
+      });
+      assert.equal(requests, 0);
+    });
+  }
+});
+
+test("playbook and loop token metric parameters validate and dry-run safely", async (t) => {
+  const cases = [
+    ["validate-playbook", "validate", validPlaybookPayload({ parameters: [{ name: "tokenBudget", value: 10000 }] }), ["--type", "playbook"]],
+    ["validate-loop", "validate", validLoopPayload({ parameters: [{ name: "inputTokenCount", value: 3000 }] }), ["--type", "loop"]],
+    ["publish-playbook", "publish-playbook", validPlaybookPayload({ parameters: [{ name: "tokenLimit", value: 12000 }] }), ["--slug", "portable-agent", "--api-key", "agrt_test_key", "--dry-run", "true"]],
+    ["edit-playbook", "edit-playbook", validPlaybookPayload({ parameters: [{ name: "outputTokenCount", value: 1200 }] }), ["--slug", "portable-agent", "--api-key", "agrt_test_key", "--playbook-slug", "daily-launch-review", "--dry-run", "true"]],
+    ["publish-loop", "publish-playbook", validLoopPayload({ parameters: [{ name: "totalTokenUsage", value: 4200 }] }), ["--slug", "portable-agent", "--api-key", "agrt_test_key", "--dry-run", "true"]],
+    ["edit-loop", "edit-playbook", validLoopPayload({ parameters: [{ name: "completionTokenCount", value: 1200 }] }), ["--slug", "portable-agent", "--api-key", "agrt_test_key", "--playbook-slug", "launch-loop", "--dry-run", "true"]],
+  ];
+
+  for (const [name, command, payload, extraArgs] of cases) {
+    await t.test(name, async () => {
+      const inputPath = await writePayload(`${name}-safe-token-metric.json`, payload);
+      if (command === "validate") {
+        const result = await runCli([command, "--input", inputPath, ...extraArgs]);
+        assert.equal(result.validation.valid, true);
+        return;
+      }
+
+      let preflights = 0;
+      let mutations = 0;
+      await withServer((request, response) => {
+        if (request.url === "/api/agent-protocol") {
+          preflights += 1;
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end(JSON.stringify(protocolResponse()));
+          return;
+        }
+        mutations += 1;
+        response.writeHead(500, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: "unexpected mutation" }));
+      }, async (baseUrl) => {
+        const result = await runCli([
+          command,
+          "--input",
+          inputPath,
+          ...extraArgs,
+          "--base-url",
+          baseUrl,
+        ]);
+        assert.equal(result.dryRun, true);
+        assert.equal(result.validation.valid, true);
+      });
+      assert.equal(preflights, 1);
+      assert.equal(mutations, 0);
+    });
+  }
+});
+
+test("avatar reader rejects path replacement and post-stat oversize data", async () => {
+  const { createAvatarFileReader } = await import("../bin/lib/avatar.mjs");
+  const fixture = pngFixture(256, 256);
+  const regular = (size, ino) => ({
+    dev: 7,
+    ino,
+    size,
+    isFile: () => true,
+    isSymbolicLink: () => false,
+  });
+
+  let lstatCalls = 0;
+  const racingReader = createAvatarFileReader({
+    lstat: async () => regular(fixture.length, lstatCalls++ === 0 ? 10 : 11),
+    open: async () => ({
+      stat: async () => regular(fixture.length, 10),
+      read: async (target, offset, length, position) => {
+        if (position >= fixture.length) return { bytesRead: 0 };
+        const bytesRead = Math.min(length, fixture.length - position);
+        fixture.copy(target, offset, position, position + bytesRead);
+        return { bytesRead };
+      },
+      close: async () => {},
+    }),
+  });
+  await assert.rejects(racingReader("avatar.png"), /avatar file path changed during read/u);
+
+  const oversized = Buffer.concat([fixture, Buffer.alloc((2 * 1024 * 1024) + 1)]);
+  const oversizedReader = createAvatarFileReader({
+    lstat: async () => regular(fixture.length, 20),
+    open: async () => ({
+      stat: async () => regular(fixture.length, 20),
+      read: async (target, offset, length, position) => {
+        if (position >= oversized.length) return { bytesRead: 0 };
+        const bytesRead = Math.min(length, oversized.length - position);
+        oversized.copy(target, offset, position, position + bytesRead);
+        return { bytesRead };
+      },
+      close: async () => {},
+    }),
+  });
+  await assert.rejects(oversizedReader("avatar.png"), /2 MiB or smaller/u);
+});
+
+test("avatar reader caps same-inode growth reads at maximum plus one byte", async () => {
+  const { createAvatarFileReader } = await import("../bin/lib/avatar.mjs");
+  const initialSize = pngFixture(256, 256).length;
+  const fileStat = {
+    dev: 11,
+    ino: 42,
+    size: initialSize,
+    isFile: () => true,
+    isSymbolicLink: () => false,
+  };
+  let totalRequested = 0;
+  let readCalls = 0;
+  const reader = createAvatarFileReader({
+    lstat: async () => fileStat,
+    open: async () => ({
+      stat: async () => fileStat,
+      read: async (target, offset, length) => {
+        readCalls += 1;
+        totalRequested += length;
+        target.fill(0x61, offset, offset + length);
+        return { bytesRead: length };
+      },
+      close: async () => {},
+    }),
+  });
+
+  await assert.rejects(reader("avatar.png"), /2 MiB or smaller/u);
+  assert.equal(totalRequested, (2 * 1024 * 1024) + 1);
+  assert.ok(readCalls >= 1);
+});
+
+test("all JSON transports reject oversized responses without disclosing body credentials", async (t) => {
+  const responseSecret = "oversized-json-response-secret";
+  const oversizedBody = JSON.stringify({ apiKey: responseSecret, padding: "x".repeat((1024 * 1024) + 32) });
+  const profilePath = await writePayload("oversized-profile.json", { name: "Portable Agent" });
+  const avatarPath = await writeTempFile("oversized-response-avatar.png", pngFixture(256, 256));
+  const cases = [
+    ["get", ["check-updates"]],
+    ["post", ["claim", "--slug", "portable-agent", "--api-key", "agrt_test_key", "--email", "operator@example.com", "--skip-contract-check", "true", "--confirm-write", "true"]],
+    ["patch", ["update-profile", "--input", profilePath, "--slug", "portable-agent", "--api-key", "agrt_test_key", "--skip-contract-check", "true", "--confirm-write", "true"]],
+    ["delete", ["delete-update", "--update-slug", "launch", "--slug", "portable-agent", "--api-key", "agrt_test_key", "--skip-contract-check", "true", "--confirm-write", "true"]],
+    ["multipart", ["upload-avatar", "--file", avatarPath, "--slug", "portable-agent", "--api-key", "agrt_test_key", "--skip-contract-check", "true", "--confirm-write", "true"]],
+  ];
+
+  for (const [name, commandArgs] of cases) {
+    await t.test(name, async () => {
+      await withServer((_request, response) => {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(oversizedBody);
+      }, async (baseUrl) => {
+        const result = await runCliFailure([...commandArgs, "--base-url", baseUrl]);
+        assert.match(result.stderr, /JSON response exceeded 1 MiB limit/u);
+        assert.equal(result.stdout.includes(responseSecret), false);
+        assert.equal(result.stderr.includes(responseSecret), false);
+      });
+    });
+  }
+});
+
+test("feed stream bounds individual events, pending data, and aggregate data", async (t) => {
+  const secret = "oversized-sse-response-secret";
+  const cases = [
+    ["event", `event: feed-update\ndata: ${secret}${"x".repeat(300 * 1024)}\n\n`, /SSE event exceeded 256 KiB limit/u],
+    ["pending", `data: ${secret}${"x".repeat(600 * 1024)}`, /SSE pending buffer exceeded 512 KiB limit/u],
+    ["aggregate", Array.from({ length: 12 }, (_, index) => `event: feed-update\ndata: ${index}-${"x".repeat(190 * 1024)}\n\n`).join(""), /SSE stream exceeded 2 MiB aggregate limit/u],
+  ];
+
+  for (const [name, body, expected] of cases) {
+    await t.test(name, async () => {
+      await withServer((_request, response) => {
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.end(body);
+      }, async (baseUrl) => {
+        const result = await runCliFailure(["feed-stream", "--base-url", baseUrl]);
+        assert.match(result.stderr, expected);
+        assert.equal(result.stdout.includes(secret), false);
+        assert.equal(result.stderr.includes(secret), false);
+      });
+    });
+  }
+});
+
+test("portable docs reserve mutations for the confirmed CLI and state filesystem limits accurately", async () => {
+  const skill = await readFile(new URL("../SKILL.md", import.meta.url), "utf8");
+  const readme = await readFile(new URL("../README.md", import.meta.url), "utf8");
+  const docs = `${skill}\n${readme}`;
+
+  assert.match(docs, /Use the CLI for every mutation/u);
+  assert.match(docs, /hosted MCP[^\n]*reads only/iu);
+  assert.match(docs, /Node\.js 20\+/u);
+  assert.match(docs, /owner-only permissions/u);
+  assert.match(docs, /no-follow/u);
+  assert.match(docs, /atomic same-directory rename/u);
+  assert.match(docs, /parent-directory fsync/u);
+  assert.match(docs, /Windows[^\n]*durability[^\n]*not guaranteed/iu);
+  assert.doesNotMatch(docs, /hosted MCP[^.]*profile reads and updates/iu);
 });
