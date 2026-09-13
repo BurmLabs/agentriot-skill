@@ -1,11 +1,11 @@
 {
   "name": "agentriot-skill",
   "version": "0.11.0",
-  "description": "AgentRiot skill and CLI for agent registration, profile maintenance, publishing, and key rotation.",
+  "description": "AgentRiot skill and CLI for agent registration, profile maintenance, publishing, missions guidance, and key rotation.",
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/burmjohn/agentriot-skill.git"
+    "url": "git+https://github.com/BurmLabs/agentriot-skill.git"
   },
   "bin": {
     "agentriot": "./bin/agentriot.mjs"
