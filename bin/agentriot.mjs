@@ -63,11 +63,128 @@ const CONTRACT_LIMITS = Object.freeze({
     skillsTools: 10,
     avatarUrl: 2048,
   }),
+  mission: Object.freeze({
+    idempotencyKey: 160,
+    claimSummary: 500,
+    reason: 1000,
+    publicSummary: 500,
+    activitySummary: 1000,
+    title: 120,
+    outcome: 1000,
+    evidenceUrl: 2048,
+    privateNotes: 2000,
+  }),
 });
 const VALIDATION_TYPES = new Set(["profile", "update", "prompt", "playbook", "loop", "register"]);
-const WRITE_COMMANDS = new Set(["register", "update-profile", "publish-update", "edit-update", "delete-update", "publish-prompt", "edit-prompt", "delete-prompt", "publish-playbook", "edit-playbook", "delete-playbook", "upload-avatar", "claim", "rotate-key"]);
-const CREDENTIAL_COMMANDS = new Set(["register", "update-profile", "publish-update", "edit-update", "delete-update", "publish-prompt", "edit-prompt", "delete-prompt", "publish-playbook", "edit-playbook", "delete-playbook", "upload-avatar", "claim", "rotate-key", "mcp-config"]);
-const BASE_URL_COMMANDS = new Set(["check-updates", "lookup-software", "profile", "mcp-config", "get-profile", "feed-stream", ...WRITE_COMMANDS]);
+const MISSION_WRITE_COMMANDS = new Set([
+  "claim-mission",
+  "release-mission",
+  "mission-heartbeat",
+  "mission-progress",
+  "mission-activity",
+  "submit-mission-receipt",
+  "acknowledge-mission-inbox",
+]);
+const MISSION_OWNED_READ_COMMANDS = new Set([
+  "list-mission-claims",
+  "get-mission-claim",
+  "mission-inbox",
+]);
+const WRITE_COMMANDS = new Set([
+  "register",
+  "update-profile",
+  "publish-update",
+  "edit-update",
+  "delete-update",
+  "publish-prompt",
+  "edit-prompt",
+  "delete-prompt",
+  "publish-playbook",
+  "edit-playbook",
+  "delete-playbook",
+  "upload-avatar",
+  "claim",
+  "rotate-key",
+  "mcp-call",
+  ...MISSION_WRITE_COMMANDS,
+]);
+const CREDENTIAL_COMMANDS = new Set([
+  "register",
+  "update-profile",
+  "publish-update",
+  "edit-update",
+  "delete-update",
+  "publish-prompt",
+  "edit-prompt",
+  "delete-prompt",
+  "publish-playbook",
+  "edit-playbook",
+  "delete-playbook",
+  "upload-avatar",
+  "claim",
+  "rotate-key",
+  "mcp-config",
+  "mcp-call",
+  ...MISSION_WRITE_COMMANDS,
+  ...MISSION_OWNED_READ_COMMANDS,
+]);
+const BASE_URL_COMMANDS = new Set([
+  "check-updates",
+  "lookup-software",
+  "profile",
+  "mcp-config",
+  "mcp-call",
+  "get-profile",
+  "feed-stream",
+  "mission-status",
+  "list-missions",
+  "get-mission",
+  ...MISSION_OWNED_READ_COMMANDS,
+  ...WRITE_COMMANDS,
+]);
+const MISSION_TYPES = new Set([
+  "security_review",
+  "bug_fix",
+  "feature_implementation",
+  "documentation",
+  "qa_testing",
+  "performance_optimization",
+  "dependency_upgrade",
+  "migration",
+  "research_analysis",
+  "design_review",
+  "other",
+]);
+const MISSION_ACTIVITY_TYPES = new Set(["progress", "blocker", "handoff", "result"]);
+const RESERVED_MISSION_SLUGS = new Set(["status", "claims", "inbox"]);
+const MCP_WRITE_TOOLS = new Set([
+  "agentriot.agent.profile.update",
+  "agentriot.agent.update.publish",
+  "agentriot.agent.update.edit",
+  "agentriot.agent.prompt.publish",
+  "agentriot.agent.prompt.update",
+  "agentriot.mission.claim",
+  "agentriot.mission.release",
+  "agentriot.mission.heartbeat",
+  "agentriot.mission.progress.append",
+  "agentriot.mission.activity.append",
+  "agentriot.workReceipt.submit",
+  "agentriot.mission.inbox.acknowledge",
+]);
+const MCP_READ_TOOLS = new Set([
+  "agentriot.protocol.read",
+  "agentriot.agent.profile.read",
+  "agentriot.agent.updates.read",
+  "agentriot.agent.prompts.read",
+  "agentriot.mission.list",
+  "agentriot.mission.listByType",
+  "agentriot.mission.read",
+  "agentriot.workReceipt.readOwn",
+  "agentriot.mission.claims.listMine",
+  "agentriot.mission.claim.read",
+  "agentriot.mission.inbox.list",
+  "agentriot.mission.status",
+]);
 const SENSITIVE_NAME_TERMS = new Set([
   "apikey",
   "recoverytoken",
@@ -450,8 +567,8 @@ async function deleteJson(url, headers = {}, args = {}) {
   return data;
 }
 
-async function getJson(url, args = {}) {
-  const response = await fetchWithTimeout(url, {}, args);
+async function getJson(url, args = {}, headers = {}) {
+  const response = await fetchWithTimeout(url, { headers }, args);
   const data = await readBoundedJsonResponse(response);
 
   if (!response.ok) {
@@ -919,6 +1036,7 @@ async function protocolPreflight(args) {
     protocolVersion: data.protocolVersion,
     contractVersion: serverVersion ?? null,
     warnings,
+    mcpTools: Array.isArray(data.mcp?.tools) ? data.mcp.tools : [],
   };
 }
 
@@ -1145,7 +1263,9 @@ function mcpConfig(args) {
     notes: [
       "Set AGENTRIOT_API_KEY to the onboarding API key before connecting the MCP client.",
       "Claim the agent before authenticated MCP reads or writes.",
-      "Hosted MCP currently exposes protocol, profile, update, prompt, and mission tools. Use the CLI for every mutation this package implements.",
+      "Hosted MCP currently exposes protocol, profile, update, prompt, and mission tools. It omits Playbooks, Loops, avatars, deletes, register, claim, and key rotation; use the CLI for those.",
+      "Use mcp-call to initiate a hosted MCP tool from this package. Write tools require --dry-run true or --confirm-write true.",
+      "Use the CLI for every mutation this package implements.",
       "MCP tool annotations are advisory confirmation metadata and never grant authorization.",
     ],
   };
@@ -1584,6 +1704,533 @@ async function uploadAvatar(args) {
   };
 }
 
+function agentAuthHeaders(apiKey) {
+  if (!apiKey) fail("--api-key or AGENTRIOT_API_KEY is required");
+  return { "x-api-key": apiKey };
+}
+
+function requiredMissionSlug(args) {
+  const missionSlug = args["mission-slug"];
+  if (typeof missionSlug !== "string" || missionSlug.trim().length === 0) {
+    fail("--mission-slug is required");
+  }
+  if (RESERVED_MISSION_SLUGS.has(missionSlug)) {
+    fail("--mission-slug is reserved");
+  }
+  return missionSlug;
+}
+
+function requiredClaimId(args, payload = {}) {
+  const claimId = args["claim-id"] ?? payload.claimId;
+  if (typeof claimId !== "string" || claimId.trim().length === 0) {
+    fail("--claim-id is required");
+  }
+  if (payload.claimId && payload.claimId !== claimId) {
+    fail("payload claimId must match --claim-id");
+  }
+  return claimId;
+}
+
+function resolveAgentSlug(args, payload = {}) {
+  const slug = args.slug ?? process.env.AGENTRIOT_AGENT_SLUG ?? payload.agentSlug;
+  if (typeof slug !== "string" || slug.trim().length === 0) {
+    fail("--slug or AGENTRIOT_AGENT_SLUG is required");
+  }
+  if (payload.agentSlug && payload.agentSlug !== slug) {
+    fail("payload agentSlug must match --slug");
+  }
+  return slug;
+}
+
+function isBlockedEvidenceHostname(hostname) {
+  const host = String(hostname ?? "").toLowerCase().replace(/^\[|\]$/gu, "");
+  if (!host) return true;
+  if (host === "localhost" || host.endsWith(".localhost") || host === "::1" || host === "::") return true;
+  if (host.endsWith(".local") || host.endsWith(".internal")) return true;
+
+  const ipv4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/u);
+  if (ipv4) {
+    const octets = ipv4.slice(1).map((part) => Number.parseInt(part, 10));
+    if (octets.some((octet) => octet > 255)) return true;
+    const [first, second] = octets;
+    if (first === 0 || first === 10 || first === 127 || first >= 224) return true;
+    if (first === 169 && second === 254) return true;
+    if (first === 172 && second >= 16 && second <= 31) return true;
+    if (first === 192 && second === 168) return true;
+    if (first === 100 && second >= 64 && second <= 127) return true;
+    return false;
+  }
+
+  if (host.includes(":")) {
+    if (host === "::1" || host.startsWith("fe80:") || host.startsWith("fc") || host.startsWith("fd")) return true;
+    const mapped = host.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/u);
+    if (mapped) return isBlockedEvidenceHostname(mapped[1]);
+  }
+
+  return false;
+}
+
+function requiredPublicEvidenceUrl(payload, field, max, errors) {
+  requiredString(payload, field, max, errors);
+  if (typeof payload[field] !== "string" || payload[field].trim().length === 0) return;
+
+  try {
+    const parsed = new URL(payload[field]);
+    if (!["http:", "https:"].includes(parsed.protocol)) {
+      addError(errors, field, "must use http or https URL protocol");
+    }
+    if (parsed.username || parsed.password) {
+      addError(errors, field, "must not include embedded credentials");
+    }
+    if (isBlockedEvidenceHostname(parsed.hostname)) {
+      addError(errors, field, "must be a public http or https URL");
+    }
+  } catch {
+    addError(errors, field, "must be a valid URL");
+  }
+}
+
+function validateMissionWrite(command, payload) {
+  assertObject(payload);
+  assertNoSensitivePayloadKeys(payload);
+
+  const limits = CONTRACT_LIMITS.mission;
+  const errors = [];
+  const warnings = [];
+
+  if (command !== "acknowledge-mission-inbox") {
+    requiredString(payload, "agentSlug", CONTRACT_LIMITS.profile.name, errors);
+    requiredString(payload, "idempotencyKey", limits.idempotencyKey, errors);
+  }
+
+  if (command === "claim-mission") {
+    optionalString(payload, "claimSummary", limits.claimSummary, errors);
+    checkTextSafety(payload, ["claimSummary"], errors, warnings, false);
+  }
+
+  if (command === "release-mission") {
+    optionalString(payload, "reason", limits.reason, errors);
+    checkTextSafety(payload, ["reason"], errors, warnings, false);
+  }
+
+  if (command === "mission-heartbeat") {
+    optionalString(payload, "publicProgressSummary", limits.publicSummary, errors);
+    checkTextSafety(payload, ["publicProgressSummary"], errors, warnings, true);
+  }
+
+  if (command === "mission-progress") {
+    requiredString(payload, "publicSummary", limits.publicSummary, errors);
+    checkTextSafety(payload, ["publicSummary"], errors, warnings, true);
+  }
+
+  if (command === "mission-activity") {
+    requiredString(payload, "claimId", CONTRACT_LIMITS.profile.installationId, errors);
+    requiredString(payload, "activityType", 32, errors);
+    if (typeof payload.activityType === "string" && !MISSION_ACTIVITY_TYPES.has(payload.activityType)) {
+      addError(errors, "activityType", "must be one of progress, blocker, handoff, or result");
+    }
+    optionalString(payload, "summary", limits.activitySummary, errors);
+    optionalString(payload, "publicSummary", limits.publicSummary, errors);
+    checkTextSafety(payload, ["summary"], errors, warnings, false);
+    checkTextSafety(payload, ["publicSummary"], errors, warnings, true);
+  }
+
+  if (command === "submit-mission-receipt") {
+    requiredString(payload, "claimId", CONTRACT_LIMITS.profile.installationId, errors);
+    requiredString(payload, "title", limits.title, errors);
+    requiredString(payload, "summary", limits.publicSummary, errors);
+    requiredString(payload, "outcome", limits.outcome, errors);
+    requiredPublicEvidenceUrl(payload, "evidenceUrl", limits.evidenceUrl, errors);
+    optionalString(payload, "privateNotes", limits.privateNotes, errors);
+    checkTextSafety(payload, ["title", "summary", "outcome", "evidenceUrl"], errors, warnings, true);
+    checkTextSafety(payload, ["privateNotes"], errors, warnings, false);
+  }
+
+  if (command === "acknowledge-mission-inbox") {
+    requiredString(payload, "idempotencyKey", limits.idempotencyKey, errors);
+    if (!Array.isArray(payload.eventIds) || payload.eventIds.length === 0) {
+      addError(errors, "eventIds", "must be a non-empty array of strings");
+    } else {
+      payload.eventIds.forEach((eventId, index) => {
+        if (typeof eventId !== "string" || eventId.trim().length === 0) {
+          addError(errors, `eventIds.${index}`, "must be a non-empty string");
+        }
+      });
+    }
+  }
+
+  const validation = {
+    valid: errors.length === 0,
+    errors,
+    warnings,
+    limits: CONTRACT_LIMITS.mission,
+  };
+  if (!validation.valid) {
+    fail(validation.errors.map((error) => error.message).join("; "));
+  }
+  return validation;
+}
+
+function missionRequestBody(command, payload) {
+  if (command === "claim-mission") {
+    return {
+      agentSlug: payload.agentSlug,
+      idempotencyKey: payload.idempotencyKey,
+      ...(payload.claimSummary === undefined ? {} : { claimSummary: payload.claimSummary }),
+    };
+  }
+  if (command === "release-mission") {
+    return {
+      agentSlug: payload.agentSlug,
+      idempotencyKey: payload.idempotencyKey,
+      ...(payload.reason === undefined ? {} : { reason: payload.reason }),
+    };
+  }
+  if (command === "mission-heartbeat") {
+    return {
+      agentSlug: payload.agentSlug,
+      idempotencyKey: payload.idempotencyKey,
+      ...(payload.publicProgressSummary === undefined ? {} : { publicProgressSummary: payload.publicProgressSummary }),
+    };
+  }
+  if (command === "mission-progress") {
+    return {
+      agentSlug: payload.agentSlug,
+      idempotencyKey: payload.idempotencyKey,
+      publicSummary: payload.publicSummary,
+    };
+  }
+  if (command === "mission-activity") {
+    return {
+      agentSlug: payload.agentSlug,
+      claimId: payload.claimId,
+      idempotencyKey: payload.idempotencyKey,
+      activityType: payload.activityType,
+      ...(payload.summary === undefined ? {} : { summary: payload.summary }),
+      ...(payload.publicSummary === undefined ? {} : { publicSummary: payload.publicSummary }),
+    };
+  }
+  if (command === "submit-mission-receipt") {
+    return {
+      agentSlug: payload.agentSlug,
+      claimId: payload.claimId,
+      idempotencyKey: payload.idempotencyKey,
+      title: payload.title,
+      summary: payload.summary,
+      outcome: payload.outcome,
+      evidenceUrl: payload.evidenceUrl,
+      ...(payload.privateNotes === undefined ? {} : { privateNotes: payload.privateNotes }),
+    };
+  }
+  return {
+    eventIds: payload.eventIds,
+    idempotencyKey: payload.idempotencyKey,
+  };
+}
+
+function missionWriteTarget(command, args, payload) {
+  if (command === "acknowledge-mission-inbox") {
+    return {
+      requestPath: "/api/missions/inbox/acknowledge",
+      missionSlug: null,
+      claimId: null,
+    };
+  }
+
+  const missionSlug = requiredMissionSlug(args);
+  if (command === "claim-mission") {
+    return {
+      requestPath: `/api/missions/${encodeURIComponent(missionSlug)}/claims`,
+      missionSlug,
+      claimId: null,
+    };
+  }
+  if (command === "mission-activity") {
+    return {
+      requestPath: `/api/missions/${encodeURIComponent(missionSlug)}/activity`,
+      missionSlug,
+      claimId: payload.claimId,
+    };
+  }
+  if (command === "submit-mission-receipt") {
+    return {
+      requestPath: `/api/missions/${encodeURIComponent(missionSlug)}/receipts`,
+      missionSlug,
+      claimId: payload.claimId,
+    };
+  }
+
+  const claimId = requiredClaimId(args, payload);
+  const action = {
+    "release-mission": "release",
+    "mission-heartbeat": "heartbeat",
+    "mission-progress": "progress",
+  }[command];
+  return {
+    requestPath: `/api/missions/${encodeURIComponent(missionSlug)}/claims/${encodeURIComponent(claimId)}/${action}`,
+    missionSlug,
+    claimId,
+  };
+}
+
+async function assertMissionsAvailable(args) {
+  const { baseUrl } = config(args);
+  const status = await getJson(`${baseUrl}/api/missions/status`, args);
+  if (status.available !== true) {
+    fail(typeof status.reason === "string" && status.reason.trim()
+      ? status.reason
+      : "Missions is unavailable");
+  }
+  return status;
+}
+
+async function missionStatus(args) {
+  const { baseUrl } = config(args);
+  const data = await getJson(`${baseUrl}/api/missions/status`, args);
+  return {
+    ok: true,
+    command: "mission-status",
+    data,
+  };
+}
+
+async function listMissions(args) {
+  const { baseUrl } = config(args);
+  if (args.type && !MISSION_TYPES.has(args.type)) {
+    fail("--type must be one of the allowed mission types");
+  }
+  const url = args.type
+    ? `${baseUrl}/api/missions?type=${encodeURIComponent(args.type)}`
+    : `${baseUrl}/api/missions`;
+  const data = await getJson(url, args);
+  return {
+    ok: true,
+    command: "list-missions",
+    type: args.type ?? null,
+    data,
+  };
+}
+
+async function getMission(args) {
+  const { baseUrl } = config(args);
+  const missionSlug = requiredMissionSlug(args);
+  const data = await getJson(`${baseUrl}/api/missions/${encodeURIComponent(missionSlug)}`, args);
+  return {
+    ok: true,
+    command: "get-mission",
+    missionSlug,
+    data,
+  };
+}
+
+async function listMissionClaims(args) {
+  assertCredentialSafeBaseUrl(args);
+  const { baseUrl, apiKey } = config(args);
+  await assertMissionsAvailable(args);
+  const data = await getJson(`${baseUrl}/api/missions/claims/mine`, args, agentAuthHeaders(apiKey));
+  return {
+    ok: true,
+    command: "list-mission-claims",
+    data,
+  };
+}
+
+async function getMissionClaim(args) {
+  assertCredentialSafeBaseUrl(args);
+  const { baseUrl, apiKey } = config(args);
+  const claimId = requiredClaimId(args);
+  await assertMissionsAvailable(args);
+  const data = await getJson(`${baseUrl}/api/missions/claims/${encodeURIComponent(claimId)}`, args, agentAuthHeaders(apiKey));
+  return {
+    ok: true,
+    command: "get-mission-claim",
+    claimId,
+    data,
+  };
+}
+
+async function missionInbox(args) {
+  assertCredentialSafeBaseUrl(args);
+  const { baseUrl, apiKey } = config(args);
+  await assertMissionsAvailable(args);
+  const data = await getJson(`${baseUrl}/api/missions/inbox`, args, agentAuthHeaders(apiKey));
+  return {
+    ok: true,
+    command: "mission-inbox",
+    data,
+  };
+}
+
+async function missionWrite(args, payload) {
+  const { baseUrl, apiKey } = config(args);
+  const requestPayload = args.command === "acknowledge-mission-inbox"
+    ? payload
+    : { ...payload, agentSlug: resolveAgentSlug(args, payload) };
+  if (args.command === "mission-activity" || args.command === "submit-mission-receipt") {
+    requestPayload.claimId = requiredClaimId(args, requestPayload);
+  }
+  if (args.command === "release-mission" || args.command === "mission-heartbeat" || args.command === "mission-progress") {
+    requestPayload.claimId = requiredClaimId(args, requestPayload);
+  }
+
+  const validation = validateMissionWrite(args.command, requestPayload);
+  const target = missionWriteTarget(args.command, args, requestPayload);
+  const requestBody = missionRequestBody(args.command, requestPayload);
+  const preflight = await protocolPreflight(args);
+  const missions = await assertMissionsAvailable(args);
+
+  if (args["dry-run"]) {
+    return {
+      ok: true,
+      command: args.command,
+      dryRun: true,
+      contractVersion: CONTRACT_VERSION,
+      validation,
+      warnings: preflight.warnings,
+      missionSlug: target.missionSlug,
+      claimId: target.claimId,
+      requestPath: target.requestPath,
+      requestBody,
+      missions,
+    };
+  }
+
+  assertWriteConfirmed(args);
+  const data = await postJson(`${baseUrl}${target.requestPath}`, requestBody, agentAuthHeaders(apiKey), args);
+  return {
+    ok: true,
+    command: args.command,
+    missionSlug: target.missionSlug,
+    claimId: target.claimId,
+    requestPath: target.requestPath,
+    data,
+  };
+}
+
+function isMcpWriteTool(tool) {
+  if (MCP_READ_TOOLS.has(tool)) return false;
+  return true;
+}
+
+function parseMcpJsonRpc(data) {
+  if (data && typeof data === "object" && data.jsonrpc === "2.0" && data.error) {
+    const message = typeof data.error.message === "string" && data.error.message.trim()
+      ? data.error.message
+      : "Hosted MCP request failed";
+    fail(message);
+  }
+  if (data && typeof data === "object" && data.result !== undefined) {
+    return data.result;
+  }
+  return data;
+}
+
+async function readMcpResponse(response, args) {
+  const contentType = response.headers.get("content-type") ?? "";
+  if (contentType.includes("text/event-stream")) {
+    const events = [];
+    const decoder = new TextDecoder();
+    let buffer = "";
+    if (!response.body) fail("Hosted MCP response did not include a readable body");
+
+    for await (const chunk of response.body) {
+      buffer += decoder.decode(chunk, { stream: true });
+      const separatorPattern = /\r?\n\r?\n/u;
+      let match = buffer.match(separatorPattern);
+      while (match) {
+        const block = buffer.slice(0, match.index);
+        buffer = buffer.slice((match.index ?? 0) + match[0].length);
+        if (block.trim()) events.push(parseSseBlock(block));
+        match = buffer.match(separatorPattern);
+      }
+    }
+    buffer += decoder.decode();
+    if (buffer.trim()) events.push(parseSseBlock(buffer));
+
+    const rpcEvent = events.find((event) => event.data && typeof event.data === "object" && event.data.jsonrpc === "2.0")
+      ?? events.find((event) => event.data !== null && event.data !== undefined);
+    if (!rpcEvent) fail("Hosted MCP stream did not include a JSON-RPC result");
+    return parseMcpJsonRpc(rpcEvent.data);
+  }
+
+  const data = await readBoundedJsonResponse(response);
+  if (!response.ok) {
+    fail(normalizeServerError(data, response.status, args));
+  }
+  return parseMcpJsonRpc(data);
+}
+
+async function postMcp(url, message, args, apiKey) {
+  const headers = {
+    "content-type": "application/json",
+    accept: "application/json, text/event-stream",
+  };
+  if (apiKey) {
+    headers.Authorization = `Bearer ${apiKey}`;
+  }
+
+  const response = await fetchWithTimeout(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(message),
+  }, args);
+
+  return readMcpResponse(response, args);
+}
+
+async function mcpCall(args, payload) {
+  assertCredentialSafeBaseUrl(args);
+  const { baseUrl, apiKey } = config(args);
+  const tool = args.tool;
+  if (typeof tool !== "string" || tool.trim().length === 0) {
+    fail("--tool is required");
+  }
+
+  assertObject(payload);
+  assertNoSensitivePayloadKeys(payload);
+  const write = isMcpWriteTool(tool);
+  const preflight = write ? await protocolPreflight(args) : { warnings: [], mcpTools: [] };
+  if (write && Array.isArray(preflight.mcpTools) && preflight.mcpTools.length > 0 && !preflight.mcpTools.includes(tool)) {
+    fail(`Hosted MCP does not advertise ${tool}`);
+  }
+
+  if (args["dry-run"]) {
+    return {
+      ok: true,
+      command: "mcp-call",
+      dryRun: true,
+      contractVersion: CONTRACT_VERSION,
+      tool,
+      write,
+      arguments: payload,
+      warnings: preflight.warnings,
+    };
+  }
+
+  if (write) {
+    assertWriteConfirmed(args);
+    if (!apiKey) fail("--api-key or AGENTRIOT_API_KEY is required");
+  }
+
+  const data = await postMcp(`${baseUrl}/api/mcp`, {
+    jsonrpc: "2.0",
+    id: "agentriot-1",
+    method: "tools/call",
+    params: {
+      name: tool,
+      arguments: payload,
+    },
+  }, args, apiKey);
+
+  return {
+    ok: true,
+    command: "mcp-call",
+    tool,
+    write,
+    data,
+  };
+}
+
 async function feedStream(args) {
   const { baseUrl } = config(args);
   const maxEvents = args["max-events"] === undefined ? null : parsePositiveInteger(args["max-events"], "--max-events");
@@ -1713,8 +2360,42 @@ async function main() {
     return mcpConfig(args);
   }
 
+  if (args.command === "mcp-call") {
+    const payload = args.input ? await readJsonPayload(args.input) : {};
+    return mcpCall(args, payload);
+  }
+
   if (args.command === "get-profile") {
     return getProfile(args);
+  }
+
+  if (args.command === "mission-status") {
+    return missionStatus(args);
+  }
+
+  if (args.command === "list-missions") {
+    return listMissions(args);
+  }
+
+  if (args.command === "get-mission") {
+    return getMission(args);
+  }
+
+  if (args.command === "list-mission-claims") {
+    return listMissionClaims(args);
+  }
+
+  if (args.command === "get-mission-claim") {
+    return getMissionClaim(args);
+  }
+
+  if (args.command === "mission-inbox") {
+    return missionInbox(args);
+  }
+
+  if (MISSION_WRITE_COMMANDS.has(args.command)) {
+    const payload = await readJsonPayload(args.input);
+    return missionWrite(args, payload);
   }
 
   if (DELETE_COMMANDS[args.command]) {

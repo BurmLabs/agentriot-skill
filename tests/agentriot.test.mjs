@@ -2969,11 +2969,15 @@ test("portable skill routes missions to a dedicated reference", async () => {
 
   assert.match(skill, /references\/missions\.md/u);
   assert.match(skill, /GET \/api\/missions\/status/u);
+  assert.match(skill, /mission-status/u);
+  assert.match(skill, /claim-mission/u);
   assert.match(missions, /GET \/api\/missions\/status/u);
   assert.match(missions, /idempotencyKey/u);
   assert.match(missions, /agentriot\.mission\.claim/u);
   assert.match(missions, /workReceipt\.submit/u);
   assert.match(missions, /review teasers/iu);
+  assert.match(missions, /agentriot mission-status/u);
+  assert.match(missions, /claim-mission/u);
   assert.doesNotMatch(missions, /localhost|--base-url/u);
 });
 
@@ -3104,7 +3108,25 @@ test("public API matrix covers every known public endpoint", async () => {
   ]) {
     assert.ok(matrix.includes(`\`${missionPath}\``), `missing mission path ${missionPath}`);
   }
-  assert.match(matrix, /does not wrap them/u);
+  assert.match(matrix, /wraps each public mission route/u);
+  for (const command of [
+    "mission-status",
+    "list-missions",
+    "get-mission",
+    "claim-mission",
+    "release-mission",
+    "mission-heartbeat",
+    "mission-progress",
+    "mission-activity",
+    "submit-mission-receipt",
+    "list-mission-claims",
+    "get-mission-claim",
+    "mission-inbox",
+    "acknowledge-mission-inbox",
+    "mcp-call",
+  ]) {
+    assert.ok(matrix.includes(command), `missing mission command coverage ${command}`);
+  }
 });
 
 test("public npm commands are clearly framed as post-publish", async () => {
@@ -3530,7 +3552,7 @@ test("portable docs reserve mutations for the confirmed CLI and state filesystem
   const docs = `${skill}\n${readme}`;
 
   assert.match(docs, /Use the CLI for every mutation this package implements/u);
-  assert.match(docs, /Hosted\s+MCP is the live path for missions/u);
+  assert.match(docs, /Hosted\s+MCP remains a live path/u);
   assert.match(docs, /claimed agent/iu);
   assert.match(docs, /Node\.js 20\+/u);
   assert.match(docs, /owner-only permissions/u);
@@ -3540,4 +3562,458 @@ test("portable docs reserve mutations for the confirmed CLI and state filesystem
   assert.match(docs, /Windows[^\n]*durability[^\n]*not guaranteed/iu);
   assert.doesNotMatch(docs, /hosted MCP[^\n]*reads only/iu);
   assert.doesNotMatch(docs, /hosted MCP[^.]*profile reads and updates/iu);
+});
+
+function missionAvailable() {
+  return { available: true, generation: 1 };
+}
+
+function missionWritePayload(command) {
+  const base = {
+    agentSlug: "lifecycle-agent",
+    idempotencyKey: `${command}-2026-09-14T00:00:00Z`,
+  };
+
+  if (command === "claim-mission") {
+    return { ...base, claimSummary: "Review the published mission." };
+  }
+  if (command === "release-mission") {
+    return { ...base, reason: "Handing capacity back." };
+  }
+  if (command === "mission-heartbeat") {
+    return { ...base, publicProgressSummary: "Still collecting public evidence." };
+  }
+  if (command === "mission-progress") {
+    return { ...base, publicSummary: "Posted the first public-safe checkpoint." };
+  }
+  if (command === "mission-activity") {
+    return {
+      ...base,
+      claimId: "mcl_1234567890",
+      activityType: "blocker",
+      publicSummary: "Waiting on a public evidence URL.",
+    };
+  }
+  if (command === "submit-mission-receipt") {
+    return {
+      ...base,
+      claimId: "mcl_1234567890",
+      title: "Feed cache repair",
+      summary: "Public-safe receipt summary.",
+      outcome: "Cache headers now match the documented contract.",
+      evidenceUrl: "https://example.com/evidence",
+    };
+  }
+  return {
+    eventIds: ["evt_example"],
+    idempotencyKey: "inbox-ack-2026-09-14T00:00:00Z",
+  };
+}
+
+test("mission public reads wrap status, list, and detail routes", async () => {
+  await withServer((request, response) => {
+    const payload = {
+      "/api/missions/status": { available: true, generation: 1 },
+      "/api/missions": { missions: [{ slug: "feed-repair", kind: "published" }] },
+      "/api/missions?type=bug_fix": { missions: [{ slug: "feed-repair", type: "bug_fix" }] },
+      "/api/missions/feed-repair": { mission: { slug: "feed-repair", claimable: true } },
+    }[request.url];
+    assert.equal(request.method, "GET");
+    assert.ok(payload, `unexpected mission read ${request.url}`);
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify(payload));
+  }, async (baseUrl) => {
+    const status = await runCli(["mission-status", "--base-url", baseUrl]);
+    assert.equal(status.ok, true);
+    assert.equal(status.command, "mission-status");
+    assert.equal(status.data.available, true);
+
+    const list = await runCli(["list-missions", "--type", "bug_fix", "--base-url", baseUrl]);
+    assert.equal(list.ok, true);
+    assert.equal(list.type, "bug_fix");
+    assert.equal(list.data.missions[0].slug, "feed-repair");
+
+    const detail = await runCli(["get-mission", "--mission-slug", "feed-repair", "--base-url", baseUrl]);
+    assert.equal(detail.ok, true);
+    assert.equal(detail.missionSlug, "feed-repair");
+    assert.equal(detail.data.mission.claimable, true);
+  });
+});
+
+test("mission owned reads send the agent key and fail closed when Missions is unavailable", async () => {
+  let mineRequests = 0;
+
+  await withServer((request, response) => {
+    if (request.url === "/api/missions/status") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ available: false, reason: "Missions is not yet publicly available." }));
+      return;
+    }
+
+    mineRequests += 1;
+    response.writeHead(500, { "content-type": "application/json" });
+    response.end(JSON.stringify({ error: "unexpected owned read" }));
+  }, async (baseUrl) => {
+    const result = await runCliFailure([
+      "list-mission-claims",
+      "--api-key",
+      "agrt_test_key",
+      "--base-url",
+      baseUrl,
+    ]);
+    assert.match(result.stderr, /Missions is not yet publicly available/u);
+    assert.equal(mineRequests, 0);
+  });
+});
+
+test("mission owned reads wrap claims and inbox when Missions is available", async () => {
+  await withServer((request, response) => {
+    if (request.url === "/api/missions/status") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(missionAvailable()));
+      return;
+    }
+
+    assert.equal(request.headers["x-api-key"], "agrt_test_key");
+    const payload = {
+      "/api/missions/claims/mine": { claims: [{ id: "mcl_1234567890" }] },
+      "/api/missions/claims/mcl_1234567890": { claim: { id: "mcl_1234567890", nextActions: ["heartbeat"] } },
+      "/api/missions/inbox": { events: [{ id: "evt_example" }] },
+    }[request.url];
+    assert.ok(payload, `unexpected owned read ${request.url}`);
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify(payload));
+  }, async (baseUrl) => {
+    const mine = await runCli(["list-mission-claims", "--api-key", "agrt_test_key", "--base-url", baseUrl]);
+    assert.equal(mine.data.claims[0].id, "mcl_1234567890");
+
+    const claim = await runCli([
+      "get-mission-claim",
+      "--claim-id",
+      "mcl_1234567890",
+      "--api-key",
+      "agrt_test_key",
+      "--base-url",
+      baseUrl,
+    ]);
+    assert.equal(claim.claimId, "mcl_1234567890");
+    assert.deepEqual(claim.data.claim.nextActions, ["heartbeat"]);
+
+    const inbox = await runCli(["mission-inbox", "--api-key", "agrt_test_key", "--base-url", baseUrl]);
+    assert.equal(inbox.data.events[0].id, "evt_example");
+  });
+});
+
+test("mission writes independently preflight dry-run and missing-confirmation phases", async (t) => {
+  const cases = [
+    {
+      command: "claim-mission",
+      extra: ["--mission-slug", "feed-repair"],
+      route: "/api/missions/feed-repair/claims",
+    },
+    {
+      command: "release-mission",
+      extra: ["--mission-slug", "feed-repair", "--claim-id", "mcl_1234567890"],
+      route: "/api/missions/feed-repair/claims/mcl_1234567890/release",
+    },
+    {
+      command: "mission-heartbeat",
+      extra: ["--mission-slug", "feed-repair", "--claim-id", "mcl_1234567890"],
+      route: "/api/missions/feed-repair/claims/mcl_1234567890/heartbeat",
+    },
+    {
+      command: "mission-progress",
+      extra: ["--mission-slug", "feed-repair", "--claim-id", "mcl_1234567890"],
+      route: "/api/missions/feed-repair/claims/mcl_1234567890/progress",
+    },
+    {
+      command: "mission-activity",
+      extra: ["--mission-slug", "feed-repair"],
+      route: "/api/missions/feed-repair/activity",
+    },
+    {
+      command: "submit-mission-receipt",
+      extra: ["--mission-slug", "feed-repair"],
+      route: "/api/missions/feed-repair/receipts",
+    },
+    {
+      command: "acknowledge-mission-inbox",
+      extra: [],
+      route: "/api/missions/inbox/acknowledge",
+    },
+  ];
+
+  for (const commandCase of cases) {
+    await t.test(commandCase.command, async () => {
+      const inputPath = await writePayload(`${commandCase.command}.json`, missionWritePayload(commandCase.command));
+      const baseArgs = [
+        commandCase.command,
+        ...commandCase.extra,
+        "--input",
+        inputPath,
+        "--api-key",
+        "agrt_test_key",
+        ...(commandCase.command === "acknowledge-mission-inbox" ? [] : ["--slug", "lifecycle-agent"]),
+      ];
+
+      for (const phase of ["dry-run", "missing-confirmation"]) {
+        let protocolRequests = 0;
+        let statusRequests = 0;
+        let mutationRequests = 0;
+
+        await withServer((request, response) => {
+          if (request.url === "/api/agent-protocol") {
+            protocolRequests += 1;
+            response.writeHead(200, { "content-type": "application/json" });
+            response.end(JSON.stringify(protocolResponse()));
+            return;
+          }
+          if (request.url === "/api/missions/status") {
+            statusRequests += 1;
+            response.writeHead(200, { "content-type": "application/json" });
+            response.end(JSON.stringify(missionAvailable()));
+            return;
+          }
+          mutationRequests += 1;
+          response.writeHead(500, { "content-type": "application/json" });
+          response.end(JSON.stringify({ error: "unexpected mutation" }));
+        }, async (baseUrl) => {
+          const args = [...baseArgs, "--base-url", baseUrl];
+          if (phase === "dry-run") {
+            const result = await runCli([...args, "--dry-run", "true"]);
+            assert.equal(result.ok, true);
+            assert.equal(result.dryRun, true);
+            assert.equal(result.command, commandCase.command);
+            assert.equal(result.requestPath, commandCase.route);
+          } else {
+            const result = await runCliFailure(args);
+            assert.match(result.stderr, /--confirm-write true is required for live writes/u);
+          }
+        });
+
+        assert.equal(protocolRequests, 1, `${commandCase.command} ${phase} protocol`);
+        assert.equal(statusRequests, 1, `${commandCase.command} ${phase} status`);
+        assert.equal(mutationRequests, 0, `${commandCase.command} ${phase} mutation`);
+      }
+    });
+  }
+});
+
+test("claim-mission posts the confirmed write after protocol and status preflight", async () => {
+  const inputPath = await writePayload("claim-mission-live.json", missionWritePayload("claim-mission"));
+  let mutationRequests = 0;
+
+  await withServer(async (request, response) => {
+    if (request.url === "/api/agent-protocol") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(protocolResponse()));
+      return;
+    }
+    if (request.url === "/api/missions/status") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(missionAvailable()));
+      return;
+    }
+
+    mutationRequests += 1;
+    assert.equal(request.method, "POST");
+    assert.equal(request.url, "/api/missions/feed-repair/claims");
+    assert.equal(request.headers["x-api-key"], "agrt_test_key");
+    assert.deepEqual(JSON.parse(await readRequestBody(request)), {
+      agentSlug: "lifecycle-agent",
+      idempotencyKey: "claim-mission-2026-09-14T00:00:00Z",
+      claimSummary: "Review the published mission.",
+    });
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ claim: { id: "mcl_1234567890" } }));
+  }, async (baseUrl) => {
+    const result = await runCli([
+      "claim-mission",
+      "--mission-slug",
+      "feed-repair",
+      "--input",
+      inputPath,
+      "--slug",
+      "lifecycle-agent",
+      "--api-key",
+      "agrt_test_key",
+      "--base-url",
+      baseUrl,
+      "--confirm-write",
+      "true",
+    ]);
+    assert.equal(result.ok, true);
+    assert.equal(result.data.claim.id, "mcl_1234567890");
+    assert.equal(mutationRequests, 1);
+  });
+});
+
+test("submit-mission-receipt rejects non-public evidence URLs before network writes", async () => {
+  const inputPath = await writePayload("private-receipt.json", {
+    ...missionWritePayload("submit-mission-receipt"),
+    evidenceUrl: "https://192.168.1.10/evidence",
+  });
+  let requests = 0;
+
+  await withServer((_request, response) => {
+    requests += 1;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify(protocolResponse()));
+  }, async (baseUrl) => {
+    const result = await runCliFailure([
+      "submit-mission-receipt",
+      "--mission-slug",
+      "feed-repair",
+      "--input",
+      inputPath,
+      "--slug",
+      "lifecycle-agent",
+      "--api-key",
+      "agrt_test_key",
+      "--base-url",
+      baseUrl,
+      "--dry-run",
+      "true",
+    ]);
+    assert.match(result.stderr, /evidenceUrl must be a public http or https URL/u);
+    assert.equal(requests, 0);
+  });
+});
+
+test("mcp-call applies dry-run and confirm-write to hosted MCP writes", async () => {
+  const inputPath = await writePayload("mcp-claim.json", {
+    agentSlug: "lifecycle-agent",
+    idempotencyKey: "mcp-claim-2026-09-14T00:00:00Z",
+  });
+  const protocol = protocolResponse({
+    mcp: {
+      tools: ["agentriot.mission.status", "agentriot.mission.claim"],
+    },
+  });
+
+  for (const phase of ["dry-run", "missing-confirmation"]) {
+    let mcpRequests = 0;
+
+    await withServer((request, response) => {
+      if (request.url === "/api/agent-protocol") {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify(protocol));
+        return;
+      }
+      mcpRequests += 1;
+      response.writeHead(500, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: "unexpected MCP write" }));
+    }, async (baseUrl) => {
+      const args = [
+        "mcp-call",
+        "--tool",
+        "agentriot.mission.claim",
+        "--input",
+        inputPath,
+        "--api-key",
+        "agrt_test_key",
+        "--base-url",
+        baseUrl,
+      ];
+      if (phase === "dry-run") {
+        const result = await runCli([...args, "--dry-run", "true"]);
+        assert.equal(result.ok, true);
+        assert.equal(result.dryRun, true);
+        assert.equal(result.write, true);
+        assert.equal(result.tool, "agentriot.mission.claim");
+      } else {
+        const result = await runCliFailure(args);
+        assert.match(result.stderr, /--confirm-write true is required for live writes/u);
+      }
+    });
+
+    assert.equal(mcpRequests, 0, `${phase} MCP mutation`);
+  }
+});
+
+test("mcp-call posts confirmed write tools and allows read tools without confirmation", async () => {
+  const inputPath = await writePayload("mcp-claim-live.json", {
+    agentSlug: "lifecycle-agent",
+    idempotencyKey: "mcp-claim-live-2026-09-14T00:00:00Z",
+  });
+
+  await withServer(async (request, response) => {
+    if (request.url === "/api/agent-protocol") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(protocolResponse({
+        mcp: { tools: ["agentriot.mission.status", "agentriot.mission.claim"] },
+      })));
+      return;
+    }
+
+    assert.equal(request.method, "POST");
+    assert.equal(request.url, "/api/mcp");
+    const body = JSON.parse(await readRequestBody(request));
+    if (body.params?.name === "agentriot.mission.status") {
+      assert.equal(request.headers.authorization, undefined);
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        jsonrpc: "2.0",
+        id: body.id,
+        result: { structuredContent: { available: true } },
+      }));
+      return;
+    }
+
+    assert.equal(request.headers.authorization, "Bearer agrt_test_key");
+    assert.equal(body.method, "tools/call");
+    assert.equal(body.params.name, "agentriot.mission.claim");
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      jsonrpc: "2.0",
+      id: body.id,
+      result: { structuredContent: { claimId: "mcl_1234567890" } },
+    }));
+  }, async (baseUrl) => {
+    const read = await runCli([
+      "mcp-call",
+      "--tool",
+      "agentriot.mission.status",
+      "--base-url",
+      baseUrl,
+    ]);
+    assert.equal(read.write, false);
+    assert.equal(read.data.structuredContent.available, true);
+
+    const write = await runCli([
+      "mcp-call",
+      "--tool",
+      "agentriot.mission.claim",
+      "--input",
+      inputPath,
+      "--api-key",
+      "agrt_test_key",
+      "--base-url",
+      baseUrl,
+      "--confirm-write",
+      "true",
+    ]);
+    assert.equal(write.write, true);
+    assert.equal(write.data.structuredContent.claimId, "mcl_1234567890");
+  });
+});
+
+test("list-missions rejects unknown type filters before network access", async () => {
+  let requests = 0;
+
+  await withServer((_request, response) => {
+    requests += 1;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ missions: [] }));
+  }, async (baseUrl) => {
+    const result = await runCliFailure([
+      "list-missions",
+      "--type",
+      "not-a-mission-type",
+      "--base-url",
+      baseUrl,
+    ]);
+    assert.match(result.stderr, /--type must be one of the allowed mission types/u);
+    assert.equal(requests, 0);
+  });
 });
