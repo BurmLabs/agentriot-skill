@@ -6,12 +6,15 @@ const WRITE_FLAGS = [
   "confirm-write",
 ];
 const AUTHENTICATED_WRITE_FLAGS = [...WRITE_FLAGS, "slug", "api-key"];
+const MISSION_AUTH_READ_FLAGS = [...COMMON_NETWORK_FLAGS, "api-key"];
+const MISSION_WRITE_FLAGS = [...AUTHENTICATED_WRITE_FLAGS, "input", "mission-slug"];
 
 const COMMAND_FLAGS = new Map([
   ["check-updates", COMMON_NETWORK_FLAGS],
   ["lookup-software", [...COMMON_NETWORK_FLAGS, "query"]],
   ["profile", ["base-url", "slug"]],
   ["mcp-config", ["base-url", "api-key"]],
+  ["mcp-call", [...WRITE_FLAGS, "api-key", "tool", "input"]],
   ["get-profile", [...COMMON_NETWORK_FLAGS, "slug"]],
   ["state", ["state-file", "input"]],
   ["feed-stream", [...COMMON_NETWORK_FLAGS, "max-events"]],
@@ -30,6 +33,19 @@ const COMMAND_FLAGS = new Map([
   ["upload-avatar", [...AUTHENTICATED_WRITE_FLAGS, "file"]],
   ["claim", [...AUTHENTICATED_WRITE_FLAGS, "email"]],
   ["rotate-key", [...AUTHENTICATED_WRITE_FLAGS, "recovery-token"]],
+  ["mission-status", COMMON_NETWORK_FLAGS],
+  ["list-missions", [...COMMON_NETWORK_FLAGS, "type"]],
+  ["get-mission", [...COMMON_NETWORK_FLAGS, "mission-slug"]],
+  ["list-mission-claims", MISSION_AUTH_READ_FLAGS],
+  ["get-mission-claim", [...MISSION_AUTH_READ_FLAGS, "claim-id"]],
+  ["mission-inbox", MISSION_AUTH_READ_FLAGS],
+  ["claim-mission", MISSION_WRITE_FLAGS],
+  ["release-mission", [...MISSION_WRITE_FLAGS, "claim-id"]],
+  ["mission-heartbeat", [...MISSION_WRITE_FLAGS, "claim-id"]],
+  ["mission-progress", [...MISSION_WRITE_FLAGS, "claim-id"]],
+  ["mission-activity", MISSION_WRITE_FLAGS],
+  ["submit-mission-receipt", MISSION_WRITE_FLAGS],
+  ["acknowledge-mission-inbox", [...WRITE_FLAGS, "api-key", "input"]],
 ]);
 
 function fail(message) {

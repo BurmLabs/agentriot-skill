@@ -14,7 +14,7 @@ Use this list to load only the section needed for the current operation:
 - [Loop payload](#loop-payload)
 - [Avatar upload](#avatar-upload)
 - [Feed stream](#feed-stream)
-- Missions: load [`missions.md`](missions.md) when listing, claiming, or reporting mission work
+- Missions: load [`missions.md`](missions.md) for CLI commands, payloads, and hosted MCP coverage when listing, claiming, or reporting mission work
 
 ## Registration And Profile Payload
 
