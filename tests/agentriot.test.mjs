@@ -237,6 +237,34 @@ test("check-updates compares local skill version to protocol metadata", async ()
     assert.equal(result.upToDate, true);
     assert.equal(result.meetsMinimum, true);
     assert.equal(result.localSkill.version, "0.11.0");
+    assert.equal(result.mcp, null);
+  });
+});
+
+test("check-updates forwards live hosted MCP protocol metadata", async () => {
+  const mcp = {
+    toolSurfaceVersion: "agentriot-mcp-tools-2",
+    endpoint: "/api/mcp",
+    tools: ["agentriot.protocol.read", "agentriot.mission.status"],
+  };
+
+  await withServer((request, response) => {
+    assert.equal(request.url, "/api/agent-protocol");
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      protocolVersion: "2026.05.16",
+      skill: {
+        name: "agentriot",
+        recommendedVersion: "0.11.0",
+        minimumVersion: "0.8.0",
+      },
+      mcp,
+    }));
+  }, async (baseUrl) => {
+    const result = await runCli(["check-updates", "--base-url", baseUrl]);
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.mcp, mcp);
   });
 });
 
@@ -288,6 +316,8 @@ test("mcp-config emits remote hosted MCP config without echoing raw keys", async
     "Bearer ${AGENTRIOT_API_KEY}",
   );
   assert.equal(JSON.stringify(result).includes("agrt_secret_key"), false);
+  assert.match(result.notes.join(" "), /authenticated MCP reads or writes/u);
+  assert.match(result.notes.join(" "), /Use the CLI for every mutation this package implements/u);
 });
 
 test("CLI defaults to AgentRiot production for static commands", async () => {
@@ -2810,6 +2840,7 @@ test("public docs avoid maintainer-only command details and exclusion lists", as
     await readFile(new URL("SKILL.md", root), "utf8"),
     await readFile(new URL("references/public-api.md", root), "utf8"),
     await readFile(new URL("references/payloads.md", root), "utf8"),
+    await readFile(new URL("references/missions.md", root), "utf8"),
   ].join("\n");
   const forbidden = [
     "localhost",
@@ -2875,6 +2906,7 @@ test("portable skill frontmatter uses standard fields and broad AgentRiot trigge
     "registration state",
     "remove public work",
     "protocol",
+    "missions",
   ]) {
     assert.ok(frontmatter.includes(trigger), `missing portable trigger: ${trigger}`);
   }
@@ -2929,6 +2961,20 @@ test("portable validator guidance pins the verified skills-ref release", async (
     /uvx --from skills-ref==0\.1\.1 agentskills validate \/tmp\/agentriot/u,
   );
   assert.doesNotMatch(maintainerGuide, /uvx --from skills-ref agentskills/u);
+});
+
+test("portable skill routes missions to a dedicated reference", async () => {
+  const skill = await readFile(new URL("../SKILL.md", import.meta.url), "utf8");
+  const missions = await readFile(new URL("../references/missions.md", import.meta.url), "utf8");
+
+  assert.match(skill, /references\/missions\.md/u);
+  assert.match(skill, /GET \/api\/missions\/status/u);
+  assert.match(missions, /GET \/api\/missions\/status/u);
+  assert.match(missions, /idempotencyKey/u);
+  assert.match(missions, /agentriot\.mission\.claim/u);
+  assert.match(missions, /workReceipt\.submit/u);
+  assert.match(missions, /review teasers/iu);
+  assert.doesNotMatch(missions, /localhost|--base-url/u);
 });
 
 test("payload references provide a compact contents list", async () => {
@@ -3046,6 +3092,19 @@ test("public API matrix covers every known public endpoint", async () => {
   const uniquePaths = new Set(expected.map(([, path]) => path));
   assert.equal(uniquePaths.size, 15);
   assert.match(matrix, /15 public paths and 19 covered method-level operations/u);
+
+  for (const missionPath of [
+    "/api/missions/status",
+    "/api/missions",
+    "/api/missions/{slug}",
+    "/api/missions/{slug}/claims",
+    "/api/missions/{slug}/receipts",
+    "/api/missions/claims/mine",
+    "/api/missions/inbox",
+  ]) {
+    assert.ok(matrix.includes(`\`${missionPath}\``), `missing mission path ${missionPath}`);
+  }
+  assert.match(matrix, /does not wrap them/u);
 });
 
 test("public npm commands are clearly framed as post-publish", async () => {
@@ -3470,13 +3529,15 @@ test("portable docs reserve mutations for the confirmed CLI and state filesystem
   const readme = await readFile(new URL("../README.md", import.meta.url), "utf8");
   const docs = `${skill}\n${readme}`;
 
-  assert.match(docs, /Use the CLI for every mutation/u);
-  assert.match(docs, /hosted MCP[^\n]*reads only/iu);
+  assert.match(docs, /Use the CLI for every mutation this package implements/u);
+  assert.match(docs, /Hosted\s+MCP is the live path for missions/u);
+  assert.match(docs, /claimed agent/iu);
   assert.match(docs, /Node\.js 20\+/u);
   assert.match(docs, /owner-only permissions/u);
   assert.match(docs, /no-follow/u);
   assert.match(docs, /atomic same-directory rename/u);
   assert.match(docs, /parent-directory fsync/u);
   assert.match(docs, /Windows[^\n]*durability[^\n]*not guaranteed/iu);
+  assert.doesNotMatch(docs, /hosted MCP[^\n]*reads only/iu);
   assert.doesNotMatch(docs, /hosted MCP[^.]*profile reads and updates/iu);
 });

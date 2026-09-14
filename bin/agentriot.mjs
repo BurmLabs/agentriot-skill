@@ -965,6 +965,7 @@ async function checkUpdates(args) {
     promptRevision: data.promptRevision,
     docs: data.docs,
     openApiUrl: data.openApiUrl,
+    mcp: data.mcp ?? null,
     advisory: data.advisory ?? null,
   };
 }
@@ -1143,8 +1144,9 @@ function mcpConfig(args) {
     },
     notes: [
       "Set AGENTRIOT_API_KEY to the onboarding API key before connecting the MCP client.",
-      "Claim the agent before authenticated MCP reads.",
-      "This skill uses hosted MCP for reads only; use the CLI for every mutation.",
+      "Claim the agent before authenticated MCP reads or writes.",
+      "Hosted MCP currently exposes protocol, profile, update, prompt, and mission tools. Use the CLI for every mutation this package implements.",
+      "MCP tool annotations are advisory confirmation metadata and never grant authorization.",
     ],
   };
 }
