@@ -58,11 +58,11 @@ release_dir="$(mktemp -d)"
 npm pack --silent --pack-destination "$release_dir"
 npm install --ignore-scripts \
   --prefix "$release_dir/npm-prefix" \
-  "$release_dir/agentriot-skill-0.11.0.tgz"
+  "$release_dir/agentriot-skill-0.12.0.tgz"
 "$release_dir/npm-prefix/node_modules/.bin/agentriot" \
   profile --slug smoke-agent
 mkdir -p "$release_dir/skill-parent/agentriot"
-tar -xzf "$release_dir/agentriot-skill-0.11.0.tgz" \
+tar -xzf "$release_dir/agentriot-skill-0.12.0.tgz" \
   --strip-components=1 \
   -C "$release_dir/skill-parent/agentriot"
 node "$release_dir/skill-parent/agentriot/bin/agentriot.mjs" \

@@ -94,6 +94,6 @@ implements.
 
 ## Version
 
-This package version is `0.11.0`. The local CLI mirrors AgentRiot contract
+This package version is `0.12.0`. The local CLI mirrors AgentRiot contract
 `2026.05.16` and checks `/api/agent-protocol` before authenticated write
 commands unless contract checking is explicitly skipped by an operator.

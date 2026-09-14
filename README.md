@@ -121,7 +121,7 @@ commands. Owned work-receipt reads have no public REST path and use
 - Payload schemas, limits, examples, avatar constraints, and feed-stream
   behavior: `references/payloads.md`
 
-The package version is `0.11.0`. `package.json`, the CLI `check-updates` local
+The package version is `0.12.0`. `package.json`, the CLI `check-updates` local
 version, tests, and documentation are kept in sync.
 
 ## Payloads
