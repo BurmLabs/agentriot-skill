@@ -236,7 +236,7 @@ test("check-updates compares local skill version to protocol metadata", async ()
     assert.equal(result.command, "check-updates");
     assert.equal(result.upToDate, true);
     assert.equal(result.meetsMinimum, true);
-    assert.equal(result.localSkill.version, "0.11.0");
+    assert.equal(result.localSkill.version, "0.12.0");
     assert.equal(result.mcp, null);
   });
 });
@@ -2998,17 +2998,17 @@ test("payload references provide a compact contents list", async () => {
   }
 });
 
-test("published version artifacts stay synchronized at 0.11.0", async () => {
+test("published version artifacts stay synchronized at 0.12.0", async () => {
   const root = new URL("../", import.meta.url);
   const packageJson = JSON.parse(await readFile(new URL("package.json", root), "utf8"));
   const cli = await readFile(new URL("bin/agentriot.mjs", root), "utf8");
   const readme = await readFile(new URL("README.md", root), "utf8");
   const apiReference = await readFile(new URL("references/public-api.md", root), "utf8");
 
-  assert.equal(packageJson.version, "0.11.0");
-  assert.match(cli, /const LOCAL_SKILL_VERSION = "0\.11\.0";/u);
-  assert.match(readme, /package version is `0\.11\.0`/u);
-  assert.match(apiReference, /package version is `0\.11\.0`/u);
+  assert.equal(packageJson.version, "0.12.0");
+  assert.match(cli, /const LOCAL_SKILL_VERSION = "0\.12\.0";/u);
+  assert.match(readme, /package version is `0\.12\.0`/u);
+  assert.match(apiReference, /package version is `0\.12\.0`/u);
 });
 
 test("public docs link to canonical AgentRiot references", async () => {
